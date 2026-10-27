@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "orchestack"
+version = "0.1.0"
+description = "Autonomous multi-repo prompt queue, CI auto-healer, and PR/MR review daemon for Antigravity, Claude Code, and OpenAI Codex across GitHub and GitLab"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [
+    { name = "The Orchestack Authors" },
+]
+dependencies = [
+    "pydantic>=2.7.0",
+    "typer>=0.12.0",
+]
+
+[project.scripts]
+orchestack = "orchestack.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orchestack"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10.0",
+    "pytest>=8.0.0",
+    "ruff>=0.5.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+markers = [
+    "live: marks tests as live forge/agent tests (run only with ORCHESTACK_LIVE_TESTS=1)",
+    "timeout: per-test safety timeout in seconds to detect infinite loops or hangs",
+]
+testpaths = ["tests", "scripts/tests"]

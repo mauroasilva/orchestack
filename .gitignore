@@ -1,0 +1,24 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Daemon runtime logs and transient PR description drafts
+logs/
+docs/PR_DESCRIPTION.md
+PR_DESCRIPTION.md
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
