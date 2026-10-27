@@ -161,6 +161,7 @@ keep all 82 baseline unit tests passing**:
       (same filename) in this PR.
 - [ ] A learnings file has been added to `docs/learnings/NNNN-short-description-learnings.md` (§5).
 - [ ] `docs/PR_DESCRIPTION.md` has been written with a comprehensive summary (§8).
+- [ ] All phase deliverables are staged and committed with a Conventional Commit message (§8), leaving `git status` clean.
 
 ---
 
