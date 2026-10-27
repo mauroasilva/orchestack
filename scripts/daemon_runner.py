@@ -42,6 +42,16 @@ if str(_SRC_DIR) not in sys.path and _SRC_DIR.is_dir():
     sys.path.insert(0, str(_SRC_DIR))
 
 from orchestack.config import RepoConfig, load_repo_config  # noqa: E402
+from orchestack.forge.github import (  # noqa: E402
+    CI_BILLING_OR_QUOTA_PATTERNS as _FORGE_CI_BILLING_OR_QUOTA_PATTERNS,
+)
+from orchestack.forge.github import (  # noqa: E402
+    GitHubForge,
+    truncate_pr_comment,
+)
+from orchestack.forge.github import (  # noqa: E402
+    is_ci_billing_or_quota_failure as _forge_is_ci_billing_or_quota_failure,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_REPO_ROOT = REPO_ROOT
@@ -1424,35 +1434,26 @@ def verify_git_staging_safety(repo_root: Path | None = None) -> tuple[bool, list
     return True, []
 
 
+def _make_github_forge(gh_bin: str = "gh") -> GitHubForge:
+    """Create a `GitHubForge` bound to active runtime callables for monkeypatch compatibility."""
+    return GitHubForge(
+        repo_root=REPO_ROOT,
+        gh_bin=gh_bin,
+        daemon_tag=DAEMON_TAG,
+        run_cmd_fn=run_cmd,
+        check_network_fn=check_network_connectivity,
+        wait_network_fn=wait_for_network_connectivity,
+    )
+
+
+def get_github_repo(gh_bin: str = "gh") -> str:
+    """Return the GitHub `owner/repo` slug for the repository."""
+    return _make_github_forge(gh_bin).get_repo_slug()
+
+
 def get_open_prs(gh_bin: str, non_blocking: bool = False) -> list[dict[str, str]]:
     """Return active open pull requests for the repository."""
-    while True:
-        try:
-            res = run_cmd(
-                [gh_bin, "pr", "list", "--state", "open", "--json", "number,title,headRefName,url"],
-                check=False,
-            )
-            if res.returncode != 0:
-                err_text = (res.stderr or "").lower()
-                if (
-                    "network" in err_text
-                    or "connection" in err_text
-                    or not check_network_connectivity()
-                ):
-                    if non_blocking:
-                        logger.warning(
-                            "Network appears offline; skipping open PRs check (non-blocking)."
-                        )
-                        return []
-                    wait_for_network_connectivity()
-                    continue
-                logger.warning("Failed to check open PRs: %s", res.stderr)
-                return []
-            data: list[dict[str, str]] = json.loads(res.stdout)
-            return data
-        except Exception as e:
-            logger.warning("Error checking open PRs: %s", e)
-            return []
+    return _make_github_forge(gh_bin).list_open_prs_raw(non_blocking=non_blocking)
 
 
 def get_branch_pr_status(gh_bin: str, branch_name: str) -> dict[str, Any] | None:
@@ -1460,46 +1461,12 @@ def get_branch_pr_status(gh_bin: str, branch_name: str) -> dict[str, Any] | None
 
     Returns a dict with 'number', 'state', 'title', and 'url', or None if no PR exists.
     """
-    try:
-        res = run_cmd(
-            [
-                gh_bin,
-                "pr",
-                "list",
-                "--head",
-                branch_name,
-                "--state",
-                "all",
-                "--json",
-                "number,state,title,url",
-            ],
-            check=False,
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            prs: list[dict[str, Any]] = json.loads(res.stdout)
-            if prs:
-                # Prefer OPEN or MERGED over CLOSED
-                for pr in prs:
-                    if pr.get("state") in ("OPEN", "MERGED"):
-                        return pr
-                return prs[0]
-    except Exception as e:
-        logger.debug("Error checking PR status for branch %s: %s", branch_name, e)
-    return None
+    return _make_github_forge(gh_bin).get_branch_pr_status(branch_name)
 
 
 def get_pr_checks(gh_bin: str, pr_number: int | str) -> list[dict[str, Any]]:
     """Fetch GitHub check runs for a PR."""
-    try:
-        res = run_cmd(
-            [gh_bin, "pr", "checks", str(pr_number), "--json", "bucket,name,state,workflow"],
-            check=False,
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            return json.loads(res.stdout)
-    except Exception as e:
-        logger.warning("Error fetching checks for PR #%s: %s", pr_number, e)
-    return []
+    return _make_github_forge(gh_bin).get_pr_checks(pr_number)
 
 
 def format_interval(seconds: int) -> str:
@@ -1515,47 +1482,7 @@ def format_interval(seconds: int) -> str:
 
 def mark_pr_ci_green(gh_bin: str, pr_number: int) -> bool:
     """Inspect PR description and ensure CI checkbox in Definition of Done is marked [x]."""
-    res = run_cmd([gh_bin, "pr", "view", str(pr_number), "--json", "body"], check=False)
-    if res.returncode != 0:
-        return False
-    try:
-        data = json.loads(res.stdout)
-        body = data.get("body", "")
-    except Exception as e:
-        logger.warning("Could not parse PR #%s body JSON: %s", pr_number, e)
-        return False
-
-    if not body:
-        return False
-
-    # Regex matching unchecked CI items in Definition of Done:
-    # - [ ] CI is green on the PR (checked automatically by daemon runner)
-    # - [ ] CI checks pass on PR branch
-    # - [ ] CI is green on the PR
-    # - [ ] CI is green
-    pattern = re.compile(r"^(\s*[-*]?\s*)\[\s*\](\s*CI\b[^\n]*)", re.IGNORECASE | re.MULTILINE)
-    if not pattern.search(body):
-        return False
-
-    updated_body = pattern.sub(r"\1[x]\2", body)
-    if updated_body == body:
-        return False
-
-    logger.info("Marking CI as green in Definition of Done for PR #%s...", pr_number)
-    edit_res = run_cmd(
-        [gh_bin, "pr", "edit", str(pr_number), "--body-file", "-"],
-        input=updated_body,
-        check=False,
-    )
-    if edit_res.returncode == 0:
-        logger.info(
-            "Updated Definition of Done in PR #%s: marked CI check as passed [x].",
-            pr_number,
-        )
-        return True
-    else:
-        logger.warning("Failed to update PR #%s description: %s", pr_number, edit_res.stderr)
-        return False
+    return _make_github_forge(gh_bin).mark_pr_ci_green(pr_number)
 
 
 def get_current_branch() -> str:
@@ -2842,22 +2769,11 @@ def ensure_pr_opened(
     pr_body = build_pr_description(prompt_path, branch_name, base_branch=base)
 
     logger.info("Opening pull request via gh pr create...")
-    create_res = run_cmd(
-        [
-            gh_bin,
-            "pr",
-            "create",
-            "--base",
-            base,
-            "--head",
-            branch_name,
-            "--title",
-            pr_title,
-            "--body-file",
-            "-",
-        ],
-        input=pr_body,
-        check=False,
+    create_res = _make_github_forge(gh_bin).create_pr_with_body(
+        branch=branch_name,
+        base_branch=base,
+        title=pr_title,
+        body=pr_body,
     )
     if create_res.returncode == 0:
         logger.info("Pull request created successfully: %s", create_res.stdout.strip())
@@ -2868,18 +2784,15 @@ def ensure_pr_opened(
             subtitle=branch_name,
         )
         return True
-    else:
-        err_out = (create_res.stderr or "") + (
-            "\n" + create_res.stdout if create_res.stdout else ""
+    err_out = (create_res.stderr or "") + ("\n" + create_res.stdout if create_res.stdout else "")
+    if "No commits between" in err_out:
+        logger.info(
+            "Branch '%s' has no commits ahead of main or is already merged into main.",
+            branch_name,
         )
-        if "No commits between" in err_out:
-            logger.info(
-                "Branch '%s' has no commits ahead of main or is already merged into main.",
-                branch_name,
-            )
-            return True
-        logger.error("Failed to open PR: %s", create_res.stderr)
-        return False
+        return True
+    logger.error("Failed to open PR: %s", create_res.stderr)
+    return False
 
 
 def load_pr_tracking_data(pr_number: int | str) -> dict[str, Any]:
@@ -2960,142 +2873,11 @@ def save_processed_comment_ids(pr_number: int | str, comment_ids: Iterable[str |
 def fetch_unhandled_pr_feedback(gh_bin: str, pr_number: int | str) -> list[dict[str, Any]]:
     """Fetch unhandled review comments, review summaries, and issue comments on a PR."""
     processed_ids = load_processed_comment_ids(pr_number)
-    unhandled: list[dict[str, Any]] = []
-
-    # 1. Fetch top-level comments and reviews via gh pr view
-    view_res = run_cmd(
-        [gh_bin, "pr", "view", str(pr_number), "--json", "comments,reviews,latestReviews"],
-        check=False,
+    unhandled, approved_ids = _make_github_forge(gh_bin).fetch_unprocessed_reviews(
+        int(pr_number), list(processed_ids)
     )
-    if view_res.returncode == 0 and view_res.stdout.strip():
-        try:
-            pr_data = json.loads(view_res.stdout)
-
-            # Check conversation comments
-            for c in pr_data.get("comments", []):
-                cid = str(c.get("id") or "")
-                if not cid or cid in processed_ids:
-                    continue
-                author = (c.get("author") or {}).get("login", "")
-                if author.endswith("[bot]") or author in ("github-actions", "codecov"):
-                    continue
-                body = (c.get("body") or "").strip()
-                if not body or DAEMON_TAG in body or "[BlueTeamHarness Daemon]" in body:
-                    continue
-                unhandled.append(
-                    {
-                        "id": cid,
-                        "type": "comment",
-                        "author": author,
-                        "body": body,
-                        "path": None,
-                        "line": None,
-                        "diff_hunk": None,
-                        "created_at": c.get("createdAt", ""),
-                    }
-                )
-
-            # Check reviews and review bodies
-            for r in pr_data.get("reviews", []):
-                rid = str(r.get("id") or "")
-                state = r.get("state", "").upper()
-                author = (r.get("author") or {}).get("login", "")
-                body = (r.get("body") or "").strip()
-
-                if state == "APPROVED":
-                    # Mark approved review as seen so it doesn't trigger feedback loop
-                    if rid and rid not in processed_ids:
-                        save_processed_comment_ids(pr_number, [rid])
-                    continue
-
-                if (
-                    rid
-                    and rid not in processed_ids
-                    and body
-                    and DAEMON_TAG not in body
-                    and not (author.endswith("[bot]") or author in ("github-actions", "codecov"))
-                ):
-                    unhandled.append(
-                        {
-                            "id": rid,
-                            "type": "review_summary",
-                            "author": author,
-                            "body": f"[{state}] {body}",
-                            "path": None,
-                            "line": None,
-                            "diff_hunk": None,
-                            "created_at": r.get("submittedAt", ""),
-                        }
-                    )
-
-                # Check inline comments attached to review in gh pr view
-                for rc in r.get("comments", []):
-                    rcid = str(rc.get("id") or "")
-                    if not rcid or rcid in processed_ids:
-                        continue
-                    rc_body = (rc.get("body") or "").strip()
-                    if (
-                        not rc_body
-                        or DAEMON_TAG in rc_body
-                        or "[BlueTeamHarness Daemon]" in rc_body
-                    ):
-                        continue
-                    rc_author = (rc.get("author") or {}).get("login", "") or author
-                    if rc_author.endswith("[bot]"):
-                        continue
-                    unhandled.append(
-                        {
-                            "id": rcid,
-                            "type": "review_comment",
-                            "author": rc_author,
-                            "body": rc_body,
-                            "path": rc.get("path"),
-                            "line": rc.get("line"),
-                            "diff_hunk": rc.get("diffHunk"),
-                            "created_at": rc.get("createdAt", ""),
-                        }
-                    )
-        except Exception as e:
-            logger.warning("Error parsing PR #%s feedback: %s", pr_number, e)
-
-    # 2. Check inline diff comments via gh api (captures any line comments not in gh pr view)
-    api_res = run_cmd(
-        [gh_bin, "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/comments"],
-        check=False,
-    )
-    if api_res.returncode == 0 and api_res.stdout.strip():
-        try:
-            diff_comments = json.loads(api_res.stdout)
-            if isinstance(diff_comments, list):
-                for dc in diff_comments:
-                    dcid = str(dc.get("id") or "")
-                    if (
-                        not dcid
-                        or dcid in processed_ids
-                        or any(item["id"] == dcid for item in unhandled)
-                    ):
-                        continue
-                    author = (dc.get("user") or {}).get("login", "")
-                    if author.endswith("[bot]") or author in ("github-actions", "codecov"):
-                        continue
-                    body = (dc.get("body") or "").strip()
-                    if not body or DAEMON_TAG in body or "[BlueTeamHarness Daemon]" in body:
-                        continue
-                    unhandled.append(
-                        {
-                            "id": dcid,
-                            "type": "review_comment",
-                            "author": author,
-                            "body": body,
-                            "path": dc.get("path"),
-                            "line": dc.get("line") or dc.get("original_line"),
-                            "diff_hunk": dc.get("diff_hunk"),
-                            "created_at": dc.get("created_at", ""),
-                        }
-                    )
-        except Exception as e:
-            logger.debug("Could not fetch inline review comments via gh api: %s", e)
-
+    for rid in approved_ids:
+        save_processed_comment_ids(pr_number, [rid])
     return unhandled
 
 
@@ -3237,18 +3019,14 @@ def address_pr_feedback(
         f"{DAEMON_TAG} Addressed {len(new_comments)} review comment(s) {commit_note}.",
     ]
     if agent_summary:
-        if len(agent_summary) > 60000:
-            agent_summary = agent_summary[:59900] + "\n\n... (truncated)"
+        agent_summary = truncate_pr_comment(agent_summary)
         comment_parts.append(f"### Findings & Response:\n{agent_summary}")
 
     comment_parts.append(
         "Definition of Done checks (`make check`) passed locally. Ready for re-review."
     )
     comment_body = "\n\n".join(comment_parts)
-    run_cmd(
-        [gh_bin, "pr", "comment", str(pr_number), "--body", comment_body],
-        check=False,
-    )
+    _make_github_forge(gh_bin).post_pr_comment(int(pr_number), comment_body)
 
     # 8. Mark comment IDs as processed and reset attempt counter
     comment_ids = [c["id"] for c in new_comments if c.get("id")]
@@ -3263,36 +3041,12 @@ def address_pr_feedback(
     return True
 
 
-CI_BILLING_OR_QUOTA_PATTERNS: tuple[str, ...] = (
-    "recent account payments have failed",
-    "spending limit needs to be increased",
-    "spending limit",
-    "billing & plans",
-    "the job was not started because",
-    "minutes quota",
-    "storage quota",
-    "artifact quota",
-    "exceeded your quota",
-    "quota has been reached",
-    "quota has been exceeded",
-    "out of included minutes",
-    "account is locked due to billing",
-)
+CI_BILLING_OR_QUOTA_PATTERNS: tuple[str, ...] = _FORGE_CI_BILLING_OR_QUOTA_PATTERNS
 
 
 def is_ci_billing_or_quota_failure(run_info_or_logs: dict[str, Any] | str | None) -> bool:
     """Return True if a CI run failed due to GitHub Actions billing, spending limit, or quota."""
-    if not run_info_or_logs:
-        return False
-    if isinstance(run_info_or_logs, dict):
-        if run_info_or_logs.get("billing_or_quota_failure") is True:
-            return True
-        text = str(run_info_or_logs.get("failed_logs") or "")
-    else:
-        text = str(run_info_or_logs)
-
-    lowered = text.lower()
-    return any(pattern in lowered for pattern in CI_BILLING_OR_QUOTA_PATTERNS)
+    return _forge_is_ci_billing_or_quota_failure(run_info_or_logs)
 
 
 def verify_local_tests_for_pr(
@@ -3334,65 +3088,10 @@ def verify_local_tests_for_pr(
 
 def fetch_latest_failed_ci_run(gh_bin: str, branch_name: str) -> dict[str, Any] | None:
     """Check if the latest workflow run for branch_name failed and fetch its logs."""
-    res = run_cmd(
-        [
-            gh_bin,
-            "run",
-            "list",
-            "--branch",
-            branch_name,
-            "--limit",
-            "1",
-            "--json",
-            "databaseId,status,conclusion,headSha,workflowName,url",
-        ],
-        check=False,
-    )
-    if res.returncode != 0 or not res.stdout.strip():
-        return None
-    try:
-        runs = json.loads(res.stdout)
-        if not runs:
-            return None
-        run = runs[0]
-        # Only handle completed runs that failed
-        if run.get("status") == "completed" and run.get("conclusion") in (
-            "failure",
-            "timed_out",
-            "action_required",
-        ):
-            run_id = run.get("databaseId")
-            log_res = run_cmd(
-                [gh_bin, "run", "view", str(run_id), "--log-failed"],
-                input="",
-                check=False,
-            )
-            failed_logs = log_res.stdout or log_res.stderr or ""
-            if (
-                log_res.returncode != 0
-                or not failed_logs.strip()
-                or "log not found" in failed_logs.lower()
-            ):
-                view_res = run_cmd(
-                    [gh_bin, "run", "view", str(run_id)],
-                    input="",
-                    check=False,
-                )
-                view_output = view_res.stdout or view_res.stderr or ""
-                if view_output.strip():
-                    failed_logs = (
-                        f"{failed_logs.strip()}\n\n{view_output.strip()}".strip()
-                        if failed_logs.strip()
-                        else view_output
-                    )
-            if len(failed_logs) > 12000:
-                failed_logs = "... [truncated output] ...\n" + failed_logs[-12000:]
-            run["failed_logs"] = failed_logs
-            run["billing_or_quota_failure"] = is_ci_billing_or_quota_failure(failed_logs)
-            return run
-    except Exception as e:
-        logger.warning("Error fetching CI run details for branch '%s': %s", branch_name, e)
-    return None
+    run = _make_github_forge(gh_bin).fetch_latest_failed_ci_run(branch_name)
+    if run is not None:
+        run["billing_or_quota_failure"] = is_ci_billing_or_quota_failure(run.get("failed_logs", ""))
+    return run
 
 
 def build_ci_failure_prompt(
@@ -3508,17 +3207,13 @@ def address_ci_failure(
         f"(auto-heal attempt {attempt_num}).",
     ]
     if agent_summary:
-        if len(agent_summary) > 60000:
-            agent_summary = agent_summary[:59900] + "\n\n... (truncated)"
+        agent_summary = truncate_pr_comment(agent_summary)
         comment_parts.append(f"### Diagnosis & Fix Summary:\n{agent_summary}")
     comment_parts.append(
         "Local Definition of Done checks (`make check`) passed. Waiting for re-run."
     )
     comment_body = "\n\n".join(comment_parts)
-    run_cmd(
-        [gh_bin, "pr", "comment", str(pr_number), "--body", comment_body],
-        check=False,
-    )
+    _make_github_forge(gh_bin).post_pr_comment(int(pr_number), comment_body)
 
     # 8. Record run_id as processed
     save_processed_comment_ids(pr_number, [f"ci-run-{run_id}"])
