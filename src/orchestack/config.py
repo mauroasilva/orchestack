@@ -114,6 +114,18 @@ def _flatten_toml_config(raw: Mapping[str, Any]) -> dict[str, Any]:
     # Normalize aliases
     if "forge" in merged and "forge_type" not in merged and isinstance(merged["forge"], str):
         merged["forge_type"] = merged.pop("forge")
+    if "provider" in merged and "forge_type" not in merged and isinstance(merged["provider"], str):
+        merged["forge_type"] = merged.pop("provider")
+    if (
+        "forge_provider" in merged
+        and "forge_type" not in merged
+        and isinstance(merged["forge_provider"], str)
+    ):
+        merged["forge_type"] = merged.pop("forge_provider")
+    if "host" in merged and "forge_host" not in merged and isinstance(merged["host"], str):
+        merged["forge_host"] = merged.pop("host")
+    if "project" in merged and "forge_project" not in merged and isinstance(merged["project"], str):
+        merged["forge_project"] = merged.pop("project")
     if "agent" in merged and "agent_type" not in merged and isinstance(merged["agent"], str):
         merged["agent_type"] = merged.pop("agent")
 
@@ -134,9 +146,16 @@ class RepoConfig:
     require_pr_description: bool = True
     auto_whitelist_collaborators: bool = True
     trusted_authors: list[str] = field(default_factory=list)
+    forge_provider: str = ""
+    forge_host: str = ""
+    forge_project: str = ""
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
+        if self.forge_provider and self.forge_type == "auto":
+            self.forge_type = self.forge_provider
+        elif not self.forge_provider:
+            self.forge_provider = self.forge_type
 
     @property
     def queued_dir(self) -> Path:
@@ -186,6 +205,9 @@ def load_repo_config(
     branch_prefix: str | None = None,
     check_cmd: str | None = None,
     forge_type: str | None = None,
+    forge_provider: str | None = None,
+    forge_host: str | None = None,
+    forge_project: str | None = None,
     agent_type: str | None = None,
     require_learnings: bool | None = None,
     require_pr_description: bool | None = None,
@@ -241,13 +263,31 @@ def load_repo_config(
         or detect_check_cmd(resolved_root)
     )
 
+    explicit_forge = forge_type if forge_type is not None else forge_provider
     final_forge_type = (
-        forge_type
-        if forge_type is not None
+        explicit_forge
+        if explicit_forge is not None
         else environ.get("ORCHESTACK_FORGE")
         or environ.get("ORCHESTACK_FORGE_TYPE")
+        or environ.get("ORCHESTACK_FORGE_PROVIDER")
         or (str(toml_data["forge_type"]) if "forge_type" in toml_data else None)
         or "auto"
+    )
+
+    final_forge_host = (
+        forge_host
+        if forge_host is not None
+        else environ.get("ORCHESTACK_FORGE_HOST")
+        or (str(toml_data["forge_host"]) if "forge_host" in toml_data else None)
+        or ""
+    )
+
+    final_forge_project = (
+        forge_project
+        if forge_project is not None
+        else environ.get("ORCHESTACK_FORGE_PROJECT")
+        or (str(toml_data["forge_project"]) if "forge_project" in toml_data else None)
+        or ""
     )
 
     final_agent_type = (
@@ -311,6 +351,9 @@ def load_repo_config(
         branch_prefix=final_branch_prefix,
         check_cmd=final_check_cmd,
         forge_type=final_forge_type,
+        forge_provider=final_forge_type,
+        forge_host=final_forge_host,
+        forge_project=final_forge_project,
         agent_type=final_agent_type,
         require_learnings=final_require_learnings,
         require_pr_description=final_require_pr_description,
