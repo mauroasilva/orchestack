@@ -212,7 +212,7 @@ Located in `src/orchestack/cli.py`:
 
 | Phase | Slug | Scope & Deliverables | Status |
 | :--- | :--- | :--- | :--- |
-| 0001 | `core-package-and-repo-config` | Extract `RepoConfig`, `.orchestack.toml` loader, `--repo` CLI support, and configurable DoD while keeping `scripts/daemon_runner.py` and all 82 baseline tests green. | Queued |
+| 0001 | `core-package-and-repo-config` | Extract `RepoConfig`, `.orchestack.toml` loader, `--repo` CLI support, and configurable DoD while keeping `scripts/daemon_runner.py` and all 82 baseline tests green. | Implemented |
 | 0002 | `forge-provider-protocol-and-github` | Define `ForgeProvider` protocol & data models in `src/orchestack/forge/` and extract `GitHubForge` from `daemon_runner.py`. | Queued |
 | 0003 | `gitlab-forge-provider` | Implement `GitLabForge` (`glab mr` + `glab api` for inline `DiffNote` discussions, approvals, and CI job trace quota checks) and forge auto-detection from git remotes. | Queued |
 | 0004 | `agent-backend-protocol-and-antigravity` | Define `AgentBackend` protocol & `PermissionDenial` models in `src/orchestack/agents/` and extract `AntigravityAgent` with all `B1`/`B2`/`B6` invariants preserved. | Queued |

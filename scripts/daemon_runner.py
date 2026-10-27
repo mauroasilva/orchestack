@@ -23,6 +23,7 @@ import os
 import queue
 import re
 import select
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -36,12 +37,32 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+_SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC_DIR) not in sys.path and _SRC_DIR.is_dir():
+    sys.path.insert(0, str(_SRC_DIR))
+
+from orchestack.config import RepoConfig, load_repo_config  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_REPO_ROOT = REPO_ROOT
 QUEUED_DIR = REPO_ROOT / "prompts" / "queued"
 IMPLEMENTED_DIR = REPO_ROOT / "prompts" / "implemented"
+LEARNINGS_DIR = REPO_ROOT / "docs" / "learnings"
+_DEFAULT_LEARNINGS_DIR = LEARNINGS_DIR
+PR_DESC_PATH = REPO_ROOT / "docs" / "PR_DESCRIPTION.md"
+_DEFAULT_PR_DESC_PATH = PR_DESC_PATH
+DAEMON_DIR = REPO_ROOT / ".daemon"
+LOCK_FILE = DAEMON_DIR / "daemon.lock"
+REVIEW_STATE_FILE = DAEMON_DIR / "review_state.json"
 LOGS_DIR = REPO_ROOT / "logs"
 PR_REVIEWS_FILE = LOGS_DIR / "pr_reviews.json"
 DAEMON_METRICS_FILE = LOGS_DIR / "daemon_metrics.jsonl"
+BASE_BRANCH = "main"
+BRANCH_PREFIX = "gemini"
+CHECK_CMD = "make check"
+REQUIRE_LEARNINGS = True
+REQUIRE_PR_DESCRIPTION = False
+ACTIVE_CONFIG: RepoConfig | None = None
 DAEMON_TAG = "🤖 **[BlueTeamHarness Daemon]**"
 DEFAULT_MAX_AUTO_HEAL_ATTEMPTS = 3
 DEFAULT_MODEL = "gemini-3.8-flash-high"
@@ -128,6 +149,47 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("bth-daemon")
+
+
+def configure_runtime(config: RepoConfig) -> RepoConfig:
+    """Rebind module-level repository paths and settings from a `RepoConfig`."""
+    global REPO_ROOT, QUEUED_DIR, IMPLEMENTED_DIR, LEARNINGS_DIR, PR_DESC_PATH
+    global DAEMON_DIR, LOCK_FILE, REVIEW_STATE_FILE, LOGS_DIR, PR_REVIEWS_FILE
+    global DAEMON_METRICS_FILE, BASE_BRANCH, BRANCH_PREFIX, CHECK_CMD
+    global REQUIRE_LEARNINGS, REQUIRE_PR_DESCRIPTION, ACTIVE_CONFIG
+
+    REPO_ROOT = config.repo_root
+    QUEUED_DIR = config.queued_dir
+    IMPLEMENTED_DIR = config.implemented_dir
+    LEARNINGS_DIR = config.learnings_dir
+    PR_DESC_PATH = config.pr_description_path
+    DAEMON_DIR = config.daemon_dir
+    LOCK_FILE = config.lock_file
+    REVIEW_STATE_FILE = config.review_state_file
+    LOGS_DIR = config.logs_dir
+    PR_REVIEWS_FILE = config.pr_reviews_file
+    DAEMON_METRICS_FILE = config.daemon_metrics_file
+    BASE_BRANCH = config.base_branch
+    BRANCH_PREFIX = config.branch_prefix
+    CHECK_CMD = config.check_cmd
+    REQUIRE_LEARNINGS = config.require_learnings
+    REQUIRE_PR_DESCRIPTION = config.require_pr_description
+    ACTIVE_CONFIG = config
+
+    for rule in (
+        f"write_file({REPO_ROOT})",
+        f"write_file({REPO_ROOT}/)",
+        f"write_file({REPO_ROOT.resolve()})",
+        f"write_file({REPO_ROOT.resolve()}/)",
+        f"write_file({REPO_ROOT}/.git)",
+        f"write_file({REPO_ROOT}/.git/)",
+        f"write_file({REPO_ROOT.resolve()}/.git)",
+        f"write_file({REPO_ROOT.resolve()}/.git/)",
+    ):
+        if rule not in SAFE_BASELINE_ALLOW:
+            SAFE_BASELINE_ALLOW.append(rule)
+
+    return config
 
 
 def find_binary(name: str, extra_paths: list[Path] | None = None) -> str | None:
@@ -1185,19 +1247,29 @@ def get_next_prompt() -> Path | None:
     return prompt_files[0][1]
 
 
-def find_prompt_path_for_branch(branch_name: str) -> Path | None:
+def find_prompt_path_for_branch(
+    branch_name: str,
+    branch_prefix: str | None = None,
+) -> Path | None:
     """Resolve prompt markdown path from branch name, stripping suffixes like -impl.
 
     Searches both prompts/implemented/ and prompts/queued/.
     Handles:
-    - Direct branch name or slug: gemini/0056-... -> 0056-...
+    - Direct branch name or slug: gemini/0056-... or orchestack/0056-... -> 0056-...
     - Suffixes appended to branch names (e.g., -impl)
     - Fallback matching on 4-digit prompt ID prefix (e.g., 0056)
     """
     if not branch_name:
         return None
 
-    slug = branch_name.removeprefix("gemini/")
+    slug = branch_name
+    for prefix_candidate in (branch_prefix, BRANCH_PREFIX, "gemini", "orchestack"):
+        if prefix_candidate and slug.startswith(f"{prefix_candidate}/"):
+            slug = slug.removeprefix(f"{prefix_candidate}/")
+            break
+    else:
+        slug = re.sub(r"^[a-zA-Z0-9_.-]+/(?=\d{4}-)", "", slug)
+
     candidates_to_try = [slug]
     if slug.endswith("-impl"):
         candidates_to_try.append(slug.removesuffix("-impl"))
@@ -1224,7 +1296,7 @@ def find_prompt_path_for_branch(branch_name: str) -> Path | None:
 def run_cmd(
     cmd: list[str],
     *,
-    cwd: Path = REPO_ROOT,
+    cwd: Path | None = None,
     check: bool = True,
     capture_output: bool = True,
     text: bool = True,
@@ -1232,11 +1304,12 @@ def run_cmd(
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Execute a shell command with repo context and optional timeout safety check."""
+    target_cwd = REPO_ROOT if cwd is None else cwd
     logger.debug("Executing: %s", " ".join(cmd))
     try:
         res = subprocess.run(
             cmd,
-            cwd=cwd,
+            cwd=target_cwd,
             check=check,
             capture_output=capture_output,
             text=text,
@@ -1274,20 +1347,23 @@ def run_cmd(
         raise
 
 
-def count_new_commits(branch_name: str) -> int:
-    """Count commits on branch_name that are not on origin/main."""
-    res = run_cmd(["git", "rev-list", "--count", f"origin/main..{branch_name}"], check=False)
+def count_new_commits(branch_name: str, base_branch: str | None = None) -> int:
+    """Count commits on branch_name that are not on origin/<base_branch>."""
+    base = base_branch or BASE_BRANCH
+    res = run_cmd(["git", "rev-list", "--count", f"origin/{base}..{branch_name}"], check=False)
     if res.returncode == 0 and res.stdout.strip().isdigit():
         return int(res.stdout.strip())
     return 0
 
 
-def verify_git_staging_safety(repo_root: Path = REPO_ROOT) -> tuple[bool, list[str]]:
+def verify_git_staging_safety(repo_root: Path | None = None) -> tuple[bool, list[str]]:
     """Verify that newly created files in critical directories are not accidentally ignored.
 
     Prevents scenarios where new test fixtures, code files, or documentation are ignored by
     overbroad .gitignore rules or .git/info/exclude, which causes missing fixture errors in CI.
     """
+    if repo_root is None:
+        repo_root = REPO_ROOT
     issues: list[str] = []
 
     # 1. Check for files in protected dirs that are ignored by git rules
@@ -1488,9 +1564,10 @@ def get_current_branch() -> str:
     return res.stdout.strip() if res.returncode == 0 else ""
 
 
-def update_main() -> None:
-    """Fetch latest changes from origin and fast-forward main with retries and lock clearing."""
-    logger.info("Syncing latest main from origin...")
+def update_main(base_branch: str | None = None) -> None:
+    """Fetch latest changes from origin and fast-forward base branch with retries."""
+    base = base_branch or BASE_BRANCH
+    logger.info("Syncing latest %s from origin...", base)
 
     # Clean up any stale git lock files left over from crashes or OneDrive sync
     git_dir = REPO_ROOT / ".git"
@@ -1507,12 +1584,13 @@ def update_main() -> None:
     for attempt in range(1, max_retries + 1):
         if not check_network_connectivity():
             wait_for_network_connectivity()
-        res = run_cmd(["git", "fetch", "origin", "main"], check=False)
+        res = run_cmd(["git", "fetch", "origin", base], check=False)
         if res.returncode == 0:
             break
         err_msg = (res.stderr or res.stdout or "").strip()
         logger.warning(
-            "git fetch origin main failed (attempt %d/%d): %s",
+            "git fetch origin %s failed (attempt %d/%d): %s",
+            base,
             attempt,
             max_retries,
             err_msg,
@@ -1522,34 +1600,42 @@ def update_main() -> None:
         else:
             res.check_returncode()
 
-    run_cmd(["git", "checkout", "main"])
-    pull_res = run_cmd(["git", "pull", "--ff-only", "origin", "main"], check=False)
+    run_cmd(["git", "checkout", base])
+    pull_res = run_cmd(["git", "pull", "--ff-only", "origin", base], check=False)
     if pull_res.returncode != 0:
         logger.warning(
-            "git pull --ff-only failed (%s). Resetting main hard to origin/main...",
+            "git pull --ff-only failed (%s). Resetting %s hard to origin/%s...",
             (pull_res.stderr or pull_res.stdout or "").strip(),
+            base,
+            base,
         )
-        run_cmd(["git", "reset", "--hard", "origin/main"])
+        run_cmd(["git", "reset", "--hard", f"origin/{base}"])
 
 
-def is_prompt_merged_into_origin_main(slug: str) -> bool:
-    """Check if the prompt has already been merged into origin/main."""
+def ensure_clean_main(base_branch: str | None = None) -> None:
+    """Ensure the repository is checked out to the clean base branch and synced with origin."""
+    update_main(base_branch=base_branch)
+
+
+def is_prompt_merged_into_origin_main(slug: str, base_branch: str | None = None) -> bool:
+    """Check if the prompt has already been merged into origin/<base_branch>."""
+    base = base_branch or BASE_BRANCH
     clean_slug = slug.removesuffix("-impl")
     slugs_to_check = [clean_slug] if clean_slug == slug else [clean_slug, slug]
     for s in slugs_to_check:
         res = run_cmd(
-            ["git", "cat-file", "-e", f"origin/main:prompts/implemented/{s}.md"],
+            ["git", "cat-file", "-e", f"origin/{base}:prompts/implemented/{s}.md"],
             check=False,
         )
         if res.returncode == 0:
             return True
 
-    # Fallback to checking by 4-digit prefix in origin/main:prompts/implemented/
+    # Fallback to checking by 4-digit prefix in origin/<base_branch>:prompts/implemented/
     match = re.match(r"^(\d{4})-", slug)
     if match:
         prefix = match.group(1)
         tree_res = run_cmd(
-            ["git", "ls-tree", "--name-only", "origin/main:prompts/implemented/"],
+            ["git", "ls-tree", "--name-only", f"origin/{base}:prompts/implemented/"],
             check=False,
         )
         if tree_res.returncode == 0 and tree_res.stdout:
@@ -1565,23 +1651,28 @@ def setup_prompt_branch(
     resume: bool = False,
     fresh: bool = False,
     gh_bin: str | None = None,
+    base_branch: str | None = None,
+    branch_prefix: str | None = None,
 ) -> str:
     """Create a clean branch for the target prompt per PROTOCOL.md §2."""
+    base = base_branch or BASE_BRANCH
+    prefix = branch_prefix or BRANCH_PREFIX
     slug = prompt_path.stem
-    branch_name = f"gemini/{slug}"
+    branch_name = f"{prefix}/{slug}"
     if (
         gh_bin
         and not resume
         and (branch_pr := get_branch_pr_status(gh_bin, branch_name))
         and str(branch_pr.get("state", "")).upper() == "MERGED"
-        and not is_prompt_merged_into_origin_main(slug)
+        and not is_prompt_merged_into_origin_main(slug, base_branch=base)
     ):
         logger.warning(
             "Branch '%s' was already merged on GitHub in PR #%s, but prompt %s is not yet "
-            "in origin/main. Using branch '%s-impl' to avoid branch reuse collision.",
+            "in origin/%s. Using branch '%s-impl' to avoid branch reuse collision.",
             branch_name,
             branch_pr.get("number"),
             slug,
+            base,
             branch_name,
         )
         branch_name = f"{branch_name}-impl"
@@ -1599,12 +1690,12 @@ def setup_prompt_branch(
         run_cmd(["git", "checkout", branch_name])
         return branch_name
 
-    logger.info("Creating clean branch '%s' off origin/main...", branch_name)
-    run_cmd(["git", "checkout", "-B", branch_name, "origin/main"])
-    pr_desc_file = REPO_ROOT / "docs" / "PR_DESCRIPTION.md"
-    if pr_desc_file.is_file():
-        with contextlib.suppress(OSError):
-            pr_desc_file.unlink()
+    logger.info("Creating clean branch '%s' off origin/%s...", branch_name, base)
+    run_cmd(["git", "checkout", "-B", branch_name, f"origin/{base}"])
+    for pr_desc_file in {PR_DESC_PATH, REPO_ROOT / "docs" / "PR_DESCRIPTION.md"}:
+        if pr_desc_file.is_file():
+            with contextlib.suppress(OSError):
+                pr_desc_file.unlink()
     return branch_name
 
 
@@ -2308,8 +2399,13 @@ def execute_prompt_session(
         # Check whether prompt has completed the implementation phase or is under verification
         impl_path = IMPLEMENTED_DIR / prompt_path.name
         if impl_path.exists():
-            learnings_file = REPO_ROOT / "docs" / "learnings" / f"{prompt_path.stem}-learnings.md"
-            if not learnings_file.exists() and turn_count < max_turns:
+            learnings_dir = (
+                LEARNINGS_DIR
+                if LEARNINGS_DIR != _DEFAULT_LEARNINGS_DIR
+                else REPO_ROOT / "docs" / "learnings"
+            )
+            learnings_file = learnings_dir / f"{prompt_path.stem}-learnings.md"
+            if REQUIRE_LEARNINGS and not learnings_file.exists() and turn_count < max_turns:
                 turn_count += 1
                 logger.warning(
                     "Prompt %s was moved to implemented/, but %s is missing. "
@@ -2323,7 +2419,7 @@ def execute_prompt_session(
                     f"The prompt file was moved to prompts/implemented/{prompt_path.name}, but "
                     f"docs/learnings/{learnings_file.name} is missing. "
                     "Per PROTOCOL.md §5, author this learnings file and docs/PR_DESCRIPTION.md, "
-                    "and ensure `make check` passes."
+                    f"and ensure `{CHECK_CMD}` passes."
                 )
                 continue
 
@@ -2352,9 +2448,9 @@ def execute_prompt_session(
                     f"Definition of Done verification failed for "
                     f"prompts/implemented/{prompt_path.name}.\n\n"
                     f"{dod_error}\n\n"
-                    "Please diagnose and resolve this issue. If 'make check' timed out, look for "
+                    f"Please diagnose and resolve this issue. If '{CHECK_CMD}' timed out, look for "
                     "infinite loops, hanging network requests, test deadlocks, or long-running "
-                    "commands. Ensure all tests and checks complete promptly and `make check` "
+                    f"commands. Ensure all tests and checks complete promptly and `{CHECK_CMD}` "
                     "passes locally."
                 )
                 continue
@@ -2384,7 +2480,7 @@ def execute_prompt_session(
                 "of Done is fully satisfied "
                 f"(move prompt to prompts/implemented/{prompt_path.name}, "
                 f"author docs/learnings/{prompt_path.stem}-learnings.md, "
-                "author docs/PR_DESCRIPTION.md, and verify that `make check` passes locally)."
+                f"author docs/PR_DESCRIPTION.md, and verify that `{CHECK_CMD}` passes locally)."
             )
             continue
         else:
@@ -2397,37 +2493,89 @@ def execute_prompt_session(
             return False
 
 
-def check_definition_of_done(prompt_path: Path) -> tuple[bool, str]:
-    """Verify local Definition of Done checks (make check, prompt moved, learnings).
+def check_definition_of_done(
+    prompt_path: Path,
+    config: RepoConfig | None = None,
+) -> tuple[bool, str]:
+    """Verify local Definition of Done checks (check_cmd, prompt moved, learnings, PR desc).
 
     Returns:
         tuple[bool, str]: (is_successful, failure_details)
     """
+    if config is not None:
+        impl_dir = config.implemented_dir
+        learnings_dir = config.learnings_dir
+        pr_desc_path = config.pr_description_path
+        check_cmd = config.check_cmd
+        req_learnings = config.require_learnings
+        req_pr_desc = config.require_pr_description
+    elif ACTIVE_CONFIG is not None and ACTIVE_CONFIG.repo_root == REPO_ROOT:
+        impl_dir = IMPLEMENTED_DIR
+        learnings_dir = LEARNINGS_DIR
+        pr_desc_path = PR_DESC_PATH
+        check_cmd = CHECK_CMD
+        req_learnings = REQUIRE_LEARNINGS
+        req_pr_desc = REQUIRE_PR_DESCRIPTION
+    else:
+        impl_dir = IMPLEMENTED_DIR
+        learnings_dir = (
+            LEARNINGS_DIR
+            if LEARNINGS_DIR != _DEFAULT_LEARNINGS_DIR
+            else REPO_ROOT / "docs" / "learnings"
+        )
+        pr_desc_path = (
+            PR_DESC_PATH
+            if PR_DESC_PATH != _DEFAULT_PR_DESC_PATH
+            else REPO_ROOT / "docs" / "PR_DESCRIPTION.md"
+        )
+        check_cmd = CHECK_CMD
+        req_learnings = REQUIRE_LEARNINGS
+        req_pr_desc = REQUIRE_PR_DESCRIPTION
+
     # 1. Check prompt moved to implemented
-    impl_path = IMPLEMENTED_DIR / prompt_path.name
+    impl_path = impl_dir / prompt_path.name
     if not impl_path.exists():
         msg = f"Prompt file {prompt_path.name} was not moved to prompts/implemented/."
         logger.error(msg)
         return False, msg
 
-    # 2. Check learnings file
-    learnings_slug = f"{prompt_path.stem}-learnings.md"
-    learnings_file = REPO_ROOT / "docs" / "learnings" / learnings_slug
-    if not learnings_file.exists():
-        msg = f"Learnings file docs/learnings/{learnings_slug} was not found."
-        logger.error("Learnings file %s was not found in docs/learnings/.", learnings_slug)
+    # 2. Check learnings file (when required)
+    if req_learnings:
+        learnings_slug = f"{prompt_path.stem}-learnings.md"
+        learnings_file = learnings_dir / learnings_slug
+        if not learnings_file.exists():
+            msg = f"Learnings file docs/learnings/{learnings_slug} was not found."
+            logger.error("Learnings file %s was not found in docs/learnings/.", learnings_slug)
+            return False, msg
+
+    # 3. Check PR description file (when required)
+    if req_pr_desc and (
+        not pr_desc_path.is_file()
+        or not pr_desc_path.read_text(encoding="utf-8", errors="replace").strip()
+    ):
+        msg = "PR description file docs/PR_DESCRIPTION.md was not found or is empty."
+        logger.error(msg)
         return False, msg
 
-    # 3. Run make check (10m safety timeout with generous margin for loaded boxes)
-    logger.info("Running Definition of Done checks: 'make check' (safety timeout: 10m)...")
-    res = run_cmd(["make", "check"], check=False, timeout=600.0)
+    # 4. Run check_cmd (10m safety timeout with generous margin for loaded boxes)
+    cmd_str = check_cmd.strip()
+    if not cmd_str or cmd_str == "true":
+        logger.info("Skipping verification command (check_cmd=%r).", check_cmd)
+        return True, ""
+
+    cmd_parts = shlex.split(cmd_str)
+    logger.info("Running Definition of Done checks: '%s' (safety timeout: 10m)...", cmd_str)
+    if config is not None and config.repo_root != REPO_ROOT:
+        res = run_cmd(cmd_parts, cwd=config.repo_root, check=False, timeout=600.0)
+    else:
+        res = run_cmd(cmd_parts, check=False, timeout=600.0)
     if res.returncode != 0:
         if res.returncode == 124:
             out_snippet = res.stdout.strip() if res.stdout else ""
             if len(out_snippet) > 2000:
                 out_snippet = out_snippet[-2000:]
             msg = (
-                "Definition of Done check 'make check' timed out after 10 minutes (600s).\n"
+                f"Definition of Done check '{cmd_str}' timed out after 10 minutes (600s).\n"
                 "Possible hang, infinite loop, or test deadlock.\n"
             )
             if out_snippet:
@@ -2435,27 +2583,27 @@ def check_definition_of_done(prompt_path: Path) -> tuple[bool, str]:
             msg += (
                 "\nPlease inspect your tests and implementation to identify what is hanging or "
                 "taking excessive time. Ensure all tests and checks complete promptly and "
-                "`make check` passes locally."
+                f"`{cmd_str}` passes locally."
             )
-            logger.error("'make check' timed out after 10m (possible hang or test deadlock).")
+            logger.error("'%s' timed out after 10m (possible hang or test deadlock).", cmd_str)
         else:
             output = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
             if len(output) > 4000:
                 output = output[-4000:]
             msg = (
-                f"'make check' failed with exit status {res.returncode}:\n\n"
+                f"'{cmd_str}' failed with exit status {res.returncode}:\n\n"
                 f"```\n{output.strip()}\n```\n"
             )
-            logger.error("'make check' failed:\n%s\n%s", res.stdout, res.stderr)
+            logger.error("'%s' failed:\n%s\n%s", cmd_str, res.stdout, res.stderr)
         return False, msg
 
-    logger.info("'make check' passed successfully.")
+    logger.info("'%s' passed successfully.", cmd_str)
     return True, ""
 
 
-def verify_definition_of_done(prompt_path: Path) -> bool:
-    """Verify local Definition of Done checks (make check, prompt moved, learnings)."""
-    ok, _ = check_definition_of_done(prompt_path)
+def verify_definition_of_done(prompt_path: Path, config: RepoConfig | None = None) -> bool:
+    """Verify local Definition of Done checks (check_cmd, prompt moved, learnings, PR desc)."""
+    ok, _ = check_definition_of_done(prompt_path, config=config)
     return ok
 
 
@@ -2546,12 +2694,21 @@ def _format_pr_from_learnings(text: str, prompt_name: str, slug: str) -> str:
     return "\n".join(sections)
 
 
-def build_pr_description(prompt_path: Path, branch_name: str) -> str:
+def build_pr_description(
+    prompt_path: Path,
+    branch_name: str,
+    base_branch: str | None = None,
+) -> str:
     """Build an informative PR description from docs/PR_DESCRIPTION.md or learnings file."""
+    base = base_branch or BASE_BRANCH
     slug = prompt_path.stem
 
     # 1. Check for docs/PR_DESCRIPTION.md (written in workspace)
-    pr_desc_file = REPO_ROOT / "docs" / "PR_DESCRIPTION.md"
+    pr_desc_file = (
+        PR_DESC_PATH
+        if PR_DESC_PATH != _DEFAULT_PR_DESC_PATH
+        else REPO_ROOT / "docs" / "PR_DESCRIPTION.md"
+    )
     if pr_desc_file.is_file():
         try:
             content = pr_desc_file.read_text(encoding="utf-8").strip()
@@ -2562,7 +2719,7 @@ def build_pr_description(prompt_path: Path, branch_name: str) -> str:
                         "\n\n---\n\n### Definition of Done\n"
                         "- [x] Prompt moved to `prompts/implemented/`\n"
                         f"- [x] Learnings file documented at `docs/learnings/{slug}-learnings.md`\n"
-                        "- [x] `make check` passes locally (format, lint, types, unit tests)\n"
+                        f"- [x] `{CHECK_CMD}` passes locally (format, lint, types, unit tests)\n"
                         "- [ ] CI is green on the PR (checked automatically by daemon runner)\n"
                     )
                 return content
@@ -2570,7 +2727,12 @@ def build_pr_description(prompt_path: Path, branch_name: str) -> str:
             logger.debug("Failed reading docs/PR_DESCRIPTION.md: %s", e)
 
     # 2. Check for learnings file on disk or branch
-    learnings_file = REPO_ROOT / "docs" / "learnings" / f"{slug}-learnings.md"
+    learnings_dir = (
+        LEARNINGS_DIR
+        if LEARNINGS_DIR != _DEFAULT_LEARNINGS_DIR
+        else REPO_ROOT / "docs" / "learnings"
+    )
+    learnings_file = learnings_dir / f"{slug}-learnings.md"
     learnings_text = ""
     if learnings_file.is_file():
         with contextlib.suppress(Exception):
@@ -2589,7 +2751,7 @@ def build_pr_description(prompt_path: Path, branch_name: str) -> str:
 
     # 3. Fallback to git commit messages
     commits_res = run_cmd(
-        ["git", "log", f"origin/main..{branch_name}", "--pretty=format:- %s (%h)"],
+        ["git", "log", f"origin/{base}..{branch_name}", "--pretty=format:- %s (%h)"],
         check=False,
     )
     commit_list = (commits_res.stdout or "").strip()
@@ -2599,21 +2761,27 @@ def build_pr_description(prompt_path: Path, branch_name: str) -> str:
         "### Definition of Done\n"
         "- [x] Prompt moved to `prompts/implemented/`\n"
         "- [x] Learnings file added\n"
-        "- [x] `make check` passes locally\n"
+        f"- [x] `{CHECK_CMD}` passes locally\n"
         "- [ ] CI is green on the PR (checked automatically by daemon runner)\n"
     )
 
 
-def ensure_pr_opened(gh_bin: str, branch_name: str, prompt_path: Path) -> bool:
+def ensure_pr_opened(
+    gh_bin: str,
+    branch_name: str,
+    prompt_path: Path,
+    base_branch: str | None = None,
+) -> bool:
     """Ensure branch is pushed and PR is open with an informative description."""
+    base = base_branch or BASE_BRANCH
     existing_pr = get_branch_pr_status(gh_bin, branch_name)
     if existing_pr:
         state = str(existing_pr.get("state", "")).upper()
         if state == "MERGED":
             slug = prompt_path.stem
-            prompt_merged = is_prompt_merged_into_origin_main(slug)
+            prompt_merged = is_prompt_merged_into_origin_main(slug, base_branch=base)
             ahead_res = run_cmd(
-                ["git", "rev-list", "--count", f"origin/main..{branch_name}"],
+                ["git", "rev-list", "--count", f"origin/{base}..{branch_name}"],
                 check=False,
             )
             ahead_count = (
@@ -2623,20 +2791,23 @@ def ensure_pr_opened(gh_bin: str, branch_name: str, prompt_path: Path) -> bool:
             )
             if ahead_count == 0 and prompt_merged:
                 logger.info(
-                    "PR #%s for branch '%s' is already merged into main: %s",
+                    "PR #%s for branch '%s' is already merged into %s: %s",
                     existing_pr.get("number"),
                     branch_name,
+                    base,
                     existing_pr.get("url"),
                 )
                 return True
             else:
                 logger.warning(
                     "PR #%s for branch '%s' is marked MERGED on GitHub, but branch has "
-                    "%d unmerged commit(s) ahead of origin/main (prompt in origin/main: %s). "
+                    "%d unmerged commit(s) ahead of origin/%s (prompt in origin/%s: %s). "
                     "Renaming branch to '%s-impl' to allow opening a new PR...",
                     existing_pr.get("number"),
                     branch_name,
                     ahead_count,
+                    base,
+                    base,
                     prompt_merged,
                     branch_name,
                 )
@@ -2668,7 +2839,7 @@ def ensure_pr_opened(gh_bin: str, branch_name: str, prompt_path: Path) -> bool:
 
     logger.info("Building pull request description...")
     pr_title = f"feat({prompt_path.stem}): implement {prompt_path.stem}"
-    pr_body = build_pr_description(prompt_path, branch_name)
+    pr_body = build_pr_description(prompt_path, branch_name, base_branch=base)
 
     logger.info("Opening pull request via gh pr create...")
     create_res = run_cmd(
@@ -2677,7 +2848,7 @@ def ensure_pr_opened(gh_bin: str, branch_name: str, prompt_path: Path) -> bool:
             "pr",
             "create",
             "--base",
-            "main",
+            base,
             "--head",
             branch_name,
             "--title",
@@ -3779,13 +3950,16 @@ def detect_uncommitted_prompt_slug() -> str | None:
     return None
 
 
-def get_in_progress_prompt_branches() -> list[tuple[int, str, str]]:
-    """Find any local gemini/<slug> branches.
+def get_in_progress_prompt_branches(
+    branch_prefix: str | None = None,
+) -> list[tuple[int, str, str]]:
+    """Find any local <branch_prefix>/<slug> branches.
 
     Returns a sorted list of (number, slug, branch_name).
     """
+    prefix = branch_prefix or BRANCH_PREFIX
     res = run_cmd(
-        ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/gemini/"],
+        ["git", "for-each-ref", "--format=%(refname:short)", f"refs/heads/{prefix}/"],
         check=False,
     )
     if res.returncode != 0 or not res.stdout.strip():
@@ -3794,7 +3968,7 @@ def get_in_progress_prompt_branches() -> list[tuple[int, str, str]]:
     branches: list[tuple[int, str, str]] = []
     for line in res.stdout.strip().splitlines():
         branch = line.strip()
-        slug = branch.removeprefix("gemini/")
+        slug = branch.removeprefix(f"{prefix}/")
         match = re.match(r"^(\d{4})-", slug)
         if not match:
             continue
@@ -3805,8 +3979,10 @@ def get_in_progress_prompt_branches() -> list[tuple[int, str, str]]:
     return branches
 
 
-def get_unmerged_implemented_prompts() -> list[tuple[int, Path]]:
-    """Find any prompts in prompts/implemented/ that are not yet merged into origin/main."""
+def get_unmerged_implemented_prompts(
+    base_branch: str | None = None,
+) -> list[tuple[int, Path]]:
+    """Find prompts in prompts/implemented/ that are not yet merged into origin."""
     if not IMPLEMENTED_DIR.is_dir():
         return []
 
@@ -3815,7 +3991,7 @@ def get_unmerged_implemented_prompts() -> list[tuple[int, Path]]:
         match = re.match(r"^(\d{4})-", path.name)
         if match:
             slug = path.stem
-            if not is_prompt_merged_into_origin_main(slug):
+            if not is_prompt_merged_into_origin_main(slug, base_branch=base_branch):
                 unmerged.append((int(match.group(1)), path))
 
     unmerged.sort(key=lambda x: x[0])
@@ -3824,22 +4000,27 @@ def get_unmerged_implemented_prompts() -> list[tuple[int, Path]]:
 
 def reconcile_startup_branch(
     gh_bin: str,
+    base_branch: str | None = None,
+    branch_prefix: str | None = None,
 ) -> tuple[str, Path | None, str | None]:
     """Inspect local repository and remote state to reconcile startup branch and active work.
 
     Returns:
         (current_branch, active_branch_candidate, active_branch_feedback)
     """
+    base = base_branch or BASE_BRANCH
+    prefix = branch_prefix or BRANCH_PREFIX
     current_branch = get_current_branch()
 
-    # Step 1: If on main, check if there are uncommitted prompt changes or unmerged local branches
-    if current_branch == "main":
+    # Step 1: If on base branch, check uncommitted prompt changes or unmerged local branches
+    if current_branch == base:
         dirty_slug = detect_uncommitted_prompt_slug()
         if dirty_slug:
-            target_branch = f"gemini/{dirty_slug}"
+            target_branch = f"{prefix}/{dirty_slug}"
             logger.info(
-                "Detected uncommitted changes for prompt %s on 'main'. Switching to branch '%s'...",
+                "Detected uncommitted changes for prompt %s on '%s'. Switching to branch '%s'...",
                 dirty_slug,
+                base,
                 target_branch,
             )
             ref_check = run_cmd(
@@ -3852,11 +4033,11 @@ def reconcile_startup_branch(
                 run_cmd(["git", "checkout", "-b", target_branch], check=True)
             current_branch = target_branch
         else:
-            run_cmd(["git", "fetch", "origin", "main"], check=False)
-            for _, slug, branch in get_in_progress_prompt_branches():
+            run_cmd(["git", "fetch", "origin", base], check=False)
+            for _, slug, branch in get_in_progress_prompt_branches(branch_prefix=prefix):
                 branch_pr = get_branch_pr_status(gh_bin, branch)
                 pr_state = (branch_pr.get("state") or "").upper() if branch_pr else ""
-                if is_prompt_merged_into_origin_main(slug):
+                if is_prompt_merged_into_origin_main(slug, base_branch=base):
                     continue
                 logger.info(
                     "Found unmerged in-progress branch '%s' (PR state: %s). Switching to it...",
@@ -3867,13 +4048,19 @@ def reconcile_startup_branch(
                 current_branch = branch
                 break
 
-    # Step 2: If on a gemini/* branch, evaluate merge state and in-progress work
-    if current_branch.startswith("gemini/"):
-        slug = current_branch.removeprefix("gemini/")
-        candidate = find_prompt_path_for_branch(current_branch)
+    # Step 2: If on a prompt branch (<prefix>/* or gemini/* or orchestack/*), evaluate merge state
+    active_prefix: str | None = None
+    for cand_prefix in (prefix, "gemini", "orchestack"):
+        if cand_prefix and current_branch.startswith(f"{cand_prefix}/"):
+            active_prefix = cand_prefix
+            break
 
-        # 1. Fetch origin/main first so remote state is known
-        run_cmd(["git", "fetch", "origin", "main"], check=False)
+    if active_prefix is not None:
+        slug = current_branch.removeprefix(f"{active_prefix}/")
+        candidate = find_prompt_path_for_branch(current_branch, branch_prefix=active_prefix)
+
+        # 1. Fetch origin/<base> first so remote state is known
+        run_cmd(["git", "fetch", "origin", base], check=False)
 
         # 2. Check if this active branch was already merged or already has an open PR
         branch_pr = get_branch_pr_status(gh_bin, current_branch)
@@ -3881,27 +4068,29 @@ def reconcile_startup_branch(
 
         status_res = run_cmd(["git", "status", "--porcelain"], check=False)
         has_uncommitted = bool(status_res.stdout.strip())
-        merged_in_origin_main = is_prompt_merged_into_origin_main(slug)
+        merged_in_origin_main = is_prompt_merged_into_origin_main(slug, base_branch=base)
 
         ancestor_res = run_cmd(
-            ["git", "merge-base", "--is-ancestor", current_branch, "origin/main"],
+            ["git", "merge-base", "--is-ancestor", current_branch, f"origin/{base}"],
             check=False,
         )
         is_ancestor = ancestor_res.returncode == 0
 
-        # Branch is only merged if origin/main contains the implemented prompt,
-        # the branch commits are an ancestor of origin/main, and the working tree is clean.
+        # Branch is only merged if origin/<base> contains the implemented prompt,
+        # the branch commits are an ancestor of origin/<base>, and the working tree is clean.
         is_merged = is_ancestor and merged_in_origin_main and not has_uncommitted
 
         if is_merged:
             pr_desc = f" (PR #{branch_pr['number']})" if branch_pr else ""
             logger.info(
-                "Active branch '%s' has already been merged into main%s. Switching to main...",
+                "Active branch '%s' has already been merged into %s%s. Switching to %s...",
                 current_branch,
+                base,
                 pr_desc,
+                base,
             )
-            run_cmd(["git", "checkout", "main"], check=False)
-            return ("main", None, None)
+            run_cmd(["git", "checkout", base], check=False)
+            return (base, None, None)
 
         if pr_state == "OPEN":
             logger.info(
@@ -3933,7 +4122,7 @@ def reconcile_startup_branch(
                         sys.exit(1)
                     run_cmd(["git", "commit", "-m", f"feat({slug}): implement {slug}"])
                 logger.info("Ensuring PR is open for completed branch '%s'...", current_branch)
-                pr_ok = ensure_pr_opened(gh_bin, current_branch, candidate)
+                pr_ok = ensure_pr_opened(gh_bin, current_branch, candidate, base_branch=base)
                 if not pr_ok:
                     logger.error(
                         "Failed to open PR for branch '%s'. Halting daemon.", current_branch
@@ -3951,10 +4140,10 @@ def reconcile_startup_branch(
                 feedback = (
                     f"Definition of Done verification failed for {candidate.name}.\n\n"
                     f"{dod_error}\n\n"
-                    "Please diagnose and resolve this issue. If 'make check' timed out, "
+                    f"Please diagnose and resolve this issue. If '{CHECK_CMD}' timed out, "
                     "look for infinite loops, hanging network requests, test deadlocks, "
-                    "or long-running commands. Ensure all tests and checks complete "
-                    "promptly and `make check` passes locally."
+                    f"or long-running commands. Ensure all tests and checks complete "
+                    f"promptly and `{CHECK_CMD}` passes locally."
                 )
                 return (current_branch, candidate, feedback)
 
@@ -3963,6 +4152,62 @@ def reconcile_startup_branch(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Blue Team Harness Prompt Daemon Runner")
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        default=None,
+        help="Target repository root directory (default: current repository root)",
+    )
+    parser.add_argument(
+        "--base-branch",
+        type=str,
+        default=None,
+        help="Target base branch for pull requests and git sync (e.g. main, master)",
+    )
+    parser.add_argument(
+        "--branch-prefix",
+        type=str,
+        default=None,
+        help="Branch prefix for prompt branches (e.g. orchestack, gemini)",
+    )
+    parser.add_argument(
+        "--check-cmd",
+        type=str,
+        default=None,
+        help="Verification command to run during Definition of Done check",
+    )
+    parser.add_argument(
+        "--forge",
+        type=str,
+        default=None,
+        choices=["auto", "github", "gitlab", "local"],
+        help="Forge adapter type override (default: auto)",
+    )
+    parser.add_argument(
+        "--agent",
+        type=str,
+        default=None,
+        choices=["gemini", "claude", "codex", "shell"],
+        help="Agent runner type override (default: gemini)",
+    )
+    parser.add_argument(
+        "--no-require-learnings",
+        action="store_true",
+        default=False,
+        help="Do not require a docs/learnings/<slug>-learnings.md file in Definition of Done",
+    )
+    parser.add_argument(
+        "--no-require-pr-description",
+        action="store_true",
+        default=False,
+        help="Do not require a docs/PR_DESCRIPTION.md file in Definition of Done",
+    )
+    parser.add_argument(
+        "--auto-whitelist",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Automatically trust repository collaborators/members for PR review feedback",
+    )
     parser.add_argument(
         "--poll-interval",
         type=int,
@@ -4019,6 +4264,34 @@ def main() -> None:
     )
     args = parser.parse_args()
     effort_val = None if args.effort == "none" else args.effort
+
+    has_config_overrides = any(
+        (
+            args.repo is not None,
+            args.base_branch is not None,
+            args.branch_prefix is not None,
+            args.check_cmd is not None,
+            args.forge is not None,
+            args.agent is not None,
+            args.no_require_learnings,
+            args.no_require_pr_description,
+            args.auto_whitelist is not None,
+            any(k.startswith("ORCHESTACK_") for k in os.environ),
+        )
+    )
+    if has_config_overrides:
+        runtime_cfg = load_repo_config(
+            repo_root=args.repo if args.repo is not None else REPO_ROOT,
+            base_branch=args.base_branch,
+            branch_prefix=args.branch_prefix,
+            check_cmd=args.check_cmd,
+            forge_type=args.forge,
+            agent_type=args.agent,
+            require_learnings=False if args.no_require_learnings else None,
+            require_pr_description=False if args.no_require_pr_description else None,
+            auto_whitelist_collaborators=args.auto_whitelist,
+        )
+        configure_runtime(runtime_cfg)
 
     gh_bin = get_gh_bin()
     agy_bin = None
@@ -4126,11 +4399,15 @@ def main() -> None:
         should_resume = False
         current_branch = get_current_branch()
         session_log = LOGS_DIR / f"session-{next_prompt.stem}.log"
+        target_branch_name = f"{BRANCH_PREFIX}/{next_prompt.stem}"
         if feedback_for_session is not None or (
             not args.fresh
             and (
                 args.resume
-                or (current_branch == f"gemini/{next_prompt.stem}" and session_log.exists())
+                or (
+                    current_branch in {target_branch_name, f"gemini/{next_prompt.stem}"}
+                    and session_log.exists()
+                )
             )
         ):
             should_resume = True
@@ -4140,7 +4417,7 @@ def main() -> None:
             )
 
         if args.dry_run:
-            action = "resume" if should_resume else f"checkout branch 'gemini/{next_prompt.stem}'"
+            action = "resume" if should_resume else f"checkout branch '{target_branch_name}'"
             logger.info("[DRY-RUN] Would %s", action)
             logger.info(
                 "[DRY-RUN] Would execute prompt '%s' with agy (--sandbox)", next_prompt.name
