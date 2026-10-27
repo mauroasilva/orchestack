@@ -26,14 +26,12 @@ import select
 import shlex
 import shutil
 import socket
-import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
 from collections.abc import Iterable
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +39,54 @@ _SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC_DIR) not in sys.path and _SRC_DIR.is_dir():
     sys.path.insert(0, str(_SRC_DIR))
 
+from orchestack.agents.antigravity import (  # noqa: E402
+    NETWORK_AND_TRANSIENT_PATTERNS as _AGY_NETWORK_AND_TRANSIENT_PATTERNS,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    AntigravityAgent,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    _get_conversation_mtime as _agy_get_conversation_mtime,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    _normalize_db_timestamp as _agy_normalize_db_timestamp,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    add_allowed_rules as _agy_add_allowed_rules,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    check_recent_soft_denial_in_cli_log as _agy_check_recent_soft_denial_in_cli_log,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    check_recent_transcript_denial as _agy_check_recent_transcript_denial,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    extract_denied_permission as _agy_extract_denied_permission,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    extract_latest_agent_summary as _agy_extract_latest_agent_summary,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    extract_session_transcript_metrics as _agy_extract_session_transcript_metrics,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    get_latest_conversation_id as _agy_get_latest_conversation_id,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    get_session_transcript_status as _agy_get_session_transcript_status,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    initialize_baseline_permissions as _agy_initialize_baseline_permissions,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    is_transient_session_error as _agy_is_transient_session_error,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    parse_denial_from_step as _agy_parse_denial_from_step,
+)
+from orchestack.agents.antigravity import (  # noqa: E402
+    parse_iso_timestamp as _agy_parse_iso_timestamp,
+)
 from orchestack.config import RepoConfig, load_repo_config  # noqa: E402
 from orchestack.forge.github import (  # noqa: E402
     CI_BILLING_OR_QUOTA_PATTERNS as _FORGE_CI_BILLING_OR_QUOTA_PATTERNS,
@@ -280,115 +326,31 @@ def send_notification(
         return False
 
 
+def _make_antigravity_agent(agy_bin: str = "agy") -> AntigravityAgent:
+    """Create an AntigravityAgent bound to current daemon_runner path globals."""
+    return AntigravityAgent(
+        agy_bin=agy_bin,
+        cli_dir=CLI_DIR,
+        brain_dir=CLI_BRAIN_DIR,
+        summaries_db=CLI_SUMMARIES_DB,
+        cli_log_file=CLI_LOG_FILE,
+        settings_file=SETTINGS_FILE,
+    )
+
+
 def initialize_baseline_permissions() -> None:
-    """Configure least-privilege permissions in settings.json.
-
-    1. Sets toolPermission to 'proceed-in-sandbox'.
-    2. Ensures the repository root paths are in trustedWorkspaces.
-    3. Purges dangerous blanket 'command(*)' from allow and ask.
-    4. Ensures safe baseline commands (with wildcard arguments) are allowed.
-    5. Blocks dangerous commands (sudo, rm -rf, curl, wget) in deny.
-    """
-    try:
-        data: dict[str, Any] = {}
-        if SETTINGS_FILE.exists():
-            try:
-                data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-
-        # 1. Set toolPermission to proceed-in-sandbox
-        data["toolPermission"] = "proceed-in-sandbox"
-
-        # 2. Add repo paths to trustedWorkspaces
-        trusted: list[str] = data.setdefault("trustedWorkspaces", [])
-        for p in (str(REPO_ROOT), str(REPO_ROOT.resolve())):
-            if p not in trusted:
-                trusted.append(p)
-
-        perms: dict[str, Any] = data.setdefault("permissions", {})
-        allow_list: list[str] = perms.setdefault("allow", [])
-        ask_list: list[str] = perms.setdefault("ask", [])
-        deny_list: list[str] = perms.setdefault("deny", [])
-
-        # 3. Remove dangerous blanket wildcards and unsupported globs
-        if "command(*)" in allow_list:
-            allow_list.remove("command(*)")
-            logger.info("Removed blanket 'command(*)' from allowlist.")
-
-        # Remove unsupported write_file globs and non-absolute paths
-        perms["allow"] = [
-            r
-            for r in allow_list
-            if not (
-                r.startswith("write_file(")
-                and (not r.startswith("write_file(/") or "/*" in r or r == "write_file(*)")
-            )
-        ]
-        allow_list = perms["allow"]
-
-        perms["deny"] = [
-            r
-            for r in deny_list
-            if not (
-                r.startswith("write_file(")
-                and (
-                    not r.startswith("write_file(/")
-                    or "/*" in r
-                    or "/.git" in r
-                    or r.endswith("/.git)")
-                    or r.endswith("/.git/)")
-                )
-            )
-        ]
-        deny_list = perms["deny"]
-
-        # 4. Remove blanket ask rules so granular allow rules take effect
-        for item in ("command(*)", "write_file(*)", "unsandboxed(*)"):
-            if item in ask_list:
-                ask_list.remove(item)
-                logger.info("Removed '%s' from ask list to enable granular allow rules.", item)
-
-        # 5. Add safe baseline commands
-        for rule in SAFE_BASELINE_ALLOW:
-            if rule not in allow_list:
-                allow_list.append(rule)
-
-        # 6. Add dangerous commands to deny
-        for rule in DEFAULT_DENY:
-            if rule not in deny_list:
-                deny_list.append(rule)
-
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        logger.info("Initialized least-privilege permissions in %s", SETTINGS_FILE)
-    except Exception as e:
-        logger.warning("Could not initialize permissions in settings.json: %s", e)
+    """Configure least-privilege permissions in settings.json."""
+    _agy_initialize_baseline_permissions(
+        settings_file=SETTINGS_FILE,
+        repo_root=REPO_ROOT,
+        safe_baseline_allow=SAFE_BASELINE_ALLOW,
+        default_deny=DEFAULT_DENY,
+    )
 
 
 def add_allowed_rules(rules: list[str] | str) -> None:
     """Add verified rule(s) to permissions.allow in settings.json."""
-    rule_list = [rules] if isinstance(rules, str) else rules
-
-    try:
-        data: dict[str, Any] = {}
-        if SETTINGS_FILE.exists():
-            try:
-                data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-
-        perms = data.setdefault("permissions", {})
-        allow_list: list[str] = perms.setdefault("allow", [])
-        for rule in rule_list:
-            if rule not in allow_list:
-                allow_list.append(rule)
-                logger.info("[+] Whitelisted rule: %s", rule)
-
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except Exception as e:
-        logger.error("Failed to write rule to settings.json: %s", e)
+    _agy_add_allowed_rules(rules, settings_file=SETTINGS_FILE)
 
 
 add_allowed_rule = add_allowed_rules
@@ -396,71 +358,12 @@ add_allowed_rule = add_allowed_rules
 
 def parse_iso_timestamp(ts_str: Any) -> float | None:
     """Parse an ISO 8601 timestamp string from a transcript step into a POSIX timestamp."""
-    if not isinstance(ts_str, str) or not ts_str.strip():
-        return None
-    try:
-        clean_str = ts_str.strip()
-        if clean_str.endswith("Z"):
-            clean_str = clean_str[:-1] + "+00:00"
-        dt = datetime.fromisoformat(clean_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
-        return dt.timestamp()
-    except Exception:
-        return None
+    return _agy_parse_iso_timestamp(ts_str)
 
 
 def parse_denial_from_step(data: dict[str, Any]) -> tuple[str, str | None] | None:
     """Extract perm_kind and target from a transcript step if it recorded a denial."""
-    err = str(data.get("error") or "")
-    if not ("user denied permission" in err or "permission check failed" in err):
-        return None
-
-    # 1. Check for quoted target in permission check failed
-    m_fail = re.search(
-        r'permission check failed for (\w+)\s+("(?:[^"\\]|\\.)*")',
-        err,
-        re.DOTALL,
-    )
-    if m_fail:
-        perm_kind = m_fail.group(1).strip()
-        raw_target = m_fail.group(2).strip()
-        try:
-            target = json.loads(raw_target)
-        except Exception:
-            target = raw_target.strip('"')
-        return perm_kind, target
-
-    # 2. Check for multiline denied command block
-    m_cmd = re.search(
-        r"user denied permission to run command:\s*\n(.*?)"
-        r"(?:\nDo not attempt to circumvent|\Z)",
-        err,
-        re.DOTALL,
-    )
-    if m_cmd:
-        target = m_cmd.group(1).strip()
-        perm_kind = "command"
-        m_k = re.search(r"permission check failed for ([a-zA-Z0-9_]+)", err)
-        if m_k:
-            perm_kind = m_k.group(1).strip()
-        return perm_kind, target
-
-    # 3. Check for action(target)
-    m_perm = re.search(
-        r"user denied permission for ([a-zA-Z0-9_]+)\((.*?)\)",
-        err,
-        re.DOTALL,
-    )
-    if m_perm:
-        perm_kind = m_perm.group(1).strip()
-        target = m_perm.group(2).strip() or None
-        return perm_kind, target
-
-    m_fallback = re.search(r"permission check failed for (\w+)", err)
-    if m_fallback:
-        return m_fallback.group(1).strip(), None
-    return "command", None
+    return _agy_parse_denial_from_step(data)
 
 
 def extract_denied_permission(
@@ -470,205 +373,22 @@ def extract_denied_permission(
     since_timestamp: float = 0.0,
 ) -> tuple[str, str | None]:
     """Inspect CLI output, recent transcripts, or CLI logs to find denied permission and target."""
-    perm_kind = "command"
-    if perm_hint:
-        if perm_hint in ("ReadUrlContent", "read_url_content", "read_url"):
-            perm_kind = "read_url"
-        else:
-            perm_kind = perm_hint
-    target: str | None = None
-
-    # 1. Parse jetski output or explicit permission denial directly from session output
-    m_jetski = re.search(
-        r'a tool required the "([^"]+)" permission that headless mode cannot prompt for',
+    return _agy_extract_denied_permission(
         full_output,
+        perm_hint=perm_hint,
+        conv_id=conv_id,
+        since_timestamp=since_timestamp,
+        brain_dir=CLI_BRAIN_DIR,
+        cli_log_file=CLI_LOG_FILE,
     )
-    if m_jetski:
-        perm_kind = m_jetski.group(1).strip()
-
-    m_fail = re.search(
-        r'permission check failed for (\w+)\s+("(?:[^"\\]|\\.)*")',
-        full_output,
-        re.DOTALL,
-    )
-    if m_fail:
-        perm_kind = m_fail.group(1).strip()
-        raw_target = m_fail.group(2).strip()
-        try:
-            target = json.loads(raw_target)
-        except Exception:
-            target = raw_target.strip('"')
-        return perm_kind, target
-
-    m_cmd = re.search(
-        r"user denied permission to run command:\s*\n(.*?)(?:\nDo not attempt to circumvent|\Z)",
-        full_output,
-        re.DOTALL,
-    )
-    if m_cmd:
-        target = m_cmd.group(1).strip()
-        m_k = re.search(r"permission check failed for ([a-zA-Z0-9_]+)", full_output)
-        if m_k:
-            perm_kind = m_k.group(1).strip()
-        return perm_kind, target
-
-    # 2. Inspect conversation transcript for exact error and target
-    try:
-        conv_dirs: list[Path] = []
-        if conv_id and (CLI_BRAIN_DIR / conv_id).is_dir():
-            conv_dirs = [CLI_BRAIN_DIR / conv_id]
-        elif CLI_BRAIN_DIR.is_dir():
-            conv_dirs = [
-                d for d in CLI_BRAIN_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")
-            ]
-
-        if conv_dirs:
-            latest_conv = max(conv_dirs, key=lambda d: d.stat().st_mtime)
-            for transcript_name in ("transcript_full.jsonl", "transcript.jsonl"):
-                t_file = latest_conv / ".system_generated" / "logs" / transcript_name
-                if not t_file.exists():
-                    continue
-                if since_timestamp > 0 and t_file.stat().st_mtime < (since_timestamp - 2.0):
-                    continue
-                try:
-                    lines = t_file.read_text(encoding="utf-8").splitlines()
-                    # First search backwards for explicit error message
-                    for line in reversed(lines):
-                        if not line.strip():
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except Exception:
-                            continue
-
-                        step_ts = parse_iso_timestamp(data.get("created_at"))
-                        if (
-                            since_timestamp > 0
-                            and step_ts is not None
-                            and step_ts < (since_timestamp - 2.0)
-                        ):
-                            break
-
-                        denial = parse_denial_from_step(data)
-                        if denial is not None:
-                            return denial
-
-                    # If no explicit error string found, search for the most recent tool call
-                    for line in reversed(lines):
-                        if not line.strip():
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except Exception:
-                            continue
-
-                        step_ts = parse_iso_timestamp(data.get("created_at"))
-                        if (
-                            since_timestamp > 0
-                            and step_ts is not None
-                            and step_ts < (since_timestamp - 2.0)
-                        ):
-                            break
-
-                        tool_calls = list(data.get("tool_calls") or [])
-                        step_update = data.get("step_update", {})
-                        if step_update.get("tool_name"):
-                            tool_calls.append(
-                                {
-                                    "name": step_update.get("tool_name"),
-                                    "args": step_update.get("tool_info", {}).get("parameters", {}),
-                                }
-                            )
-
-                        for tc in reversed(tool_calls):
-                            name = tc.get("name", "")
-                            args = tc.get("args", {})
-                            if perm_kind == "write_file" and name in (
-                                "write_to_file",
-                                "replace_file_content",
-                            ):
-                                raw_target = args.get("TargetFile")
-                                if raw_target:
-                                    raw_str = str(raw_target).strip()
-                                    if raw_str.startswith('"') and raw_str.endswith('"'):
-                                        try:
-                                            target = json.loads(raw_str)
-                                        except Exception:
-                                            target = raw_str.strip('"')
-                                    else:
-                                        target = raw_str
-                                    return perm_kind, target
-                            elif perm_kind in ("command", "unsandboxed") and name == "run_command":
-                                raw_target = args.get("CommandLine")
-                                if raw_target:
-                                    raw_str = str(raw_target).strip()
-                                    if raw_str.startswith('"') and raw_str.endswith('"'):
-                                        try:
-                                            target = json.loads(raw_str)
-                                        except Exception:
-                                            target = raw_str.strip('"')
-                                    else:
-                                        target = raw_str
-                                    return perm_kind, target
-                            elif perm_kind == "read_url" or name in (
-                                "read_url_content",
-                                "ReadUrlContent",
-                                "read_url",
-                            ):
-                                raw_url = args.get("Url") or args.get("url")
-                                if raw_url:
-                                    raw_str = str(raw_url).strip()
-                                    if raw_str.startswith('"') and raw_str.endswith('"'):
-                                        try:
-                                            target = json.loads(raw_str)
-                                        except Exception:
-                                            target = raw_str.strip('"')
-                                    else:
-                                        target = raw_str
-                                    return "read_url", target
-                except Exception as e:
-                    logger.debug("Error inspecting transcript %s: %s", t_file, e)
-    except Exception as e:
-        logger.debug("Error accessing CLI brain dir: %s", e)
-
-    # 3. Fallback to CLI log inspection
-    if CLI_LOG_FILE.exists():
-        try:
-            lines = CLI_LOG_FILE.read_text(encoding="utf-8").splitlines()[-60:]
-            for line in reversed(lines):
-                m_soft = re.search(r'soft-denying tool confirmation "([^"]+)"', line)
-                if m_soft:
-                    tool_name = m_soft.group(1).strip()
-                    if tool_name in ("ReadUrlContent", "read_url_content", "read_url"):
-                        return "read_url", target
-                    return tool_name, target
-                m = re.search(r"([a-zA-Z0-9_]+)\(([^)]+)\)", line)
-                if m:
-                    return m.group(1).strip(), m.group(2).strip()
-        except Exception:
-            pass
-
-    return perm_kind, target
 
 
 def check_recent_soft_denial_in_cli_log(since_offset: int = 0) -> str | None:
     """Inspect recent CLI log lines for soft-denied tool confirmations in print mode."""
-    if not CLI_LOG_FILE.exists():
-        return None
-    try:
-        file_size = CLI_LOG_FILE.stat().st_size
-        with CLI_LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
-            # If log was not truncated, seek to previous offset; if truncated, read from start
-            if 0 < since_offset <= file_size:
-                f.seek(since_offset)
-            lines = f.readlines()
-        for line in reversed(lines):
-            m = re.search(r'soft-denying tool confirmation "([^"]+)"', line)
-            if m:
-                return m.group(1).strip()
-    except Exception:
-        pass
-    return None
+    return _agy_check_recent_soft_denial_in_cli_log(
+        since_offset=since_offset,
+        cli_log_file=CLI_LOG_FILE,
+    )
 
 
 def check_recent_transcript_denial(
@@ -676,47 +396,11 @@ def check_recent_transcript_denial(
     conv_id: str | None = None,
 ) -> tuple[str, str | None] | None:
     """Check if the latest step in active conversation transcript recorded a denial."""
-    try:
-        conv_dirs: list[Path] = []
-        if conv_id and (CLI_BRAIN_DIR / conv_id).is_dir():
-            conv_dirs = [CLI_BRAIN_DIR / conv_id]
-        elif CLI_BRAIN_DIR.is_dir():
-            conv_dirs = [
-                d for d in CLI_BRAIN_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")
-            ]
-        if not conv_dirs:
-            return None
-        latest_conv = max(conv_dirs, key=lambda d: d.stat().st_mtime)
-        for transcript_name in ("transcript_full.jsonl", "transcript.jsonl"):
-            t_file = latest_conv / ".system_generated" / "logs" / transcript_name
-            if not t_file.exists():
-                continue
-            if since_timestamp > 0 and t_file.stat().st_mtime < (since_timestamp - 2.0):
-                continue
-            try:
-                lines = t_file.read_text(encoding="utf-8").splitlines()
-                for line in reversed(lines[-30:]):
-                    if not line.strip():
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except Exception:
-                        continue
-                    step_ts = parse_iso_timestamp(data.get("created_at"))
-                    if (
-                        since_timestamp > 0
-                        and step_ts is not None
-                        and step_ts < (since_timestamp - 2.0)
-                    ):
-                        break
-                    denial = parse_denial_from_step(data)
-                    if denial is not None:
-                        return denial
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return None
+    return _agy_check_recent_transcript_denial(
+        since_timestamp=since_timestamp,
+        conv_id=conv_id,
+        brain_dir=CLI_BRAIN_DIR,
+    )
 
 
 def extract_denied_command() -> str | None:
@@ -726,198 +410,29 @@ def extract_denied_command() -> str | None:
 
 def _get_conversation_mtime(conv_dir: Path) -> float:
     """Return the most recent modification time for a conversation directory and its transcripts."""
-    mtime = conv_dir.stat().st_mtime
-    logs_dir = conv_dir / ".system_generated" / "logs"
-    for name in ("transcript_full.jsonl", "transcript.jsonl"):
-        t_file = logs_dir / name
-        if t_file.exists():
-            with contextlib.suppress(OSError):
-                mtime = max(mtime, t_file.stat().st_mtime)
-    return mtime
+    return _agy_get_conversation_mtime(conv_dir)
 
 
 def _normalize_db_timestamp(raw_ts: Any) -> float | None:
     """Normalize a database last_modified_time value (s/ms/us/ns or ISO string) to POSIX seconds."""
-    if raw_ts is None:
-        return None
-    if isinstance(raw_ts, str):
-        try:
-            raw_ts = float(raw_ts)
-        except ValueError:
-            return parse_iso_timestamp(raw_ts)
-    if isinstance(raw_ts, (int, float)):
-        val = float(raw_ts)
-        if val <= 0:
-            return None
-        if val > 1e16:
-            return val / 1e9
-        if val > 1e13:
-            return val / 1e6
-        if val > 1e11:
-            return val / 1e3
-        return val
-    return None
+    return _agy_normalize_db_timestamp(raw_ts)
 
 
 def get_latest_conversation_id(since_timestamp: float = 0.0) -> str | None:
     """Find the latest CLI conversation ID from CLI_SUMMARIES_DB or CLI_BRAIN_DIR."""
-    db_conv_id: str | None = None
-    db_mtime: float | None = None
-    if CLI_SUMMARIES_DB.exists():
-        try:
-            with sqlite3.connect(CLI_SUMMARIES_DB) as con:
-                row = (
-                    con.cursor()
-                    .execute(
-                        "SELECT conversation_id, last_modified_time FROM conversation_summaries "
-                        "ORDER BY last_modified_time DESC LIMIT 1"
-                    )
-                    .fetchone()
-                )
-                if row:
-                    db_conv_id = row[0]
-                    db_mtime = _normalize_db_timestamp(row[1])
-        except Exception:
-            pass
-
-    brain_conv_id: str | None = None
-    brain_mtime: float = 0.0
-    db_conv_brain_mtime: float | None = None
-    try:
-        if CLI_BRAIN_DIR.is_dir():
-            conv_dirs = [
-                d for d in CLI_BRAIN_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")
-            ]
-            if conv_dirs:
-                dir_mtimes = {d.name: _get_conversation_mtime(d) for d in conv_dirs}
-                if db_conv_id and db_conv_id in dir_mtimes:
-                    db_conv_brain_mtime = dir_mtimes[db_conv_id]
-                if since_timestamp > 0:
-                    dir_mtimes = {
-                        k: v for k, v in dir_mtimes.items() if v >= (since_timestamp - 2.0)
-                    }
-                if dir_mtimes:
-                    brain_conv_id, brain_mtime = max(dir_mtimes.items(), key=lambda kv: kv[1])
-    except Exception:
-        pass
-
-    if since_timestamp > 0 and db_conv_id:
-        if db_conv_brain_mtime is not None:
-            db_is_fresh = db_conv_brain_mtime >= (since_timestamp - 2.0)
-        elif db_mtime is not None:
-            db_is_fresh = db_mtime >= (since_timestamp - 2.0)
-        else:
-            db_is_fresh = False
-        if not db_is_fresh:
-            db_conv_id = None
-
-    if (
-        db_conv_id
-        and brain_conv_id
-        and db_conv_brain_mtime is not None
-        and brain_mtime > db_conv_brain_mtime
-    ):
-        return brain_conv_id
-
-    return db_conv_id or brain_conv_id
+    return _agy_get_latest_conversation_id(
+        since_timestamp=since_timestamp,
+        brain_dir=CLI_BRAIN_DIR,
+        summaries_db=CLI_SUMMARIES_DB,
+    )
 
 
 def extract_session_transcript_metrics(conv_id: str | None = None) -> dict[str, Any]:
     """Parse session transcript to extract steps, tool counts, and estimated token/cost metrics."""
-    candidate_paths: list[Path] = []
-    if conv_id:
-        candidate_paths.extend(
-            [
-                CLI_BRAIN_DIR / conv_id / ".system_generated" / "logs" / "transcript_full.jsonl",
-                CLI_BRAIN_DIR / conv_id / ".system_generated" / "logs" / "transcript.jsonl",
-            ]
-        )
-
-    if CLI_BRAIN_DIR.is_dir():
-        for p in sorted(
-            CLI_BRAIN_DIR.glob("*/.system_generated/logs/transcript*.jsonl"),
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        ):
-            candidate_paths.append(p)
-
-    target_file = next((p for p in candidate_paths if p.is_file()), None)
-
-    metrics: dict[str, Any] = {
-        "total_steps": 0,
-        "input_tokens_estimate": 0,
-        "output_tokens_estimate": 0,
-        "total_tokens_estimate": 0,
-        "estimated_cost_usd": 0.0,
-        "tool_calls_breakdown": {},
-    }
-
-    if not target_file:
-        return metrics
-
-    try:
-        total_steps = 0
-        input_tokens = 0
-        output_tokens = 0
-        tool_counts: dict[str, int] = {}
-
-        with target_file.open("r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line_str = line.strip()
-                if not line_str:
-                    continue
-                try:
-                    data = json.loads(line_str)
-                except Exception:
-                    continue
-
-                total_steps += 1
-
-                # Check explicit token usage if available
-                usage = data.get("usage") or data.get("token_usage") or {}
-                if isinstance(usage, dict) and (
-                    usage.get("prompt_tokens") or usage.get("input_tokens")
-                ):
-                    in_t = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-                    out_t = (
-                        usage.get("completion_tokens")
-                        or usage.get("output_tokens")
-                        or usage.get("candidates_token_count")
-                        or 0
-                    )
-                    input_tokens += int(in_t)
-                    output_tokens += int(out_t)
-                else:
-                    # Estimate based on character length (~4 chars per token)
-                    step_type = data.get("type", "")
-                    content = str(data.get("content") or "")
-                    thinking = str(data.get("thinking") or "")
-                    if step_type in ("USER_INPUT", "SYSTEM_MESSAGE"):
-                        input_tokens += max(1, len(content) // 4)
-                    elif step_type == "PLANNER_RESPONSE":
-                        output_tokens += max(1, (len(content) + len(thinking)) // 4)
-
-                # Tool calls breakdown
-                tool_calls = data.get("tool_calls") or []
-                for tc in tool_calls:
-                    fn = tc.get("function") or {}
-                    tool_name = fn.get("name") or tc.get("name") or "unknown_tool"
-                    tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
-                    args = fn.get("arguments") or tc.get("args") or ""
-                    input_tokens += len(str(args)) // 4
-
-        est_cost = (input_tokens * 1.25 + output_tokens * 5.0) / 1_000_000.0
-
-        metrics["total_steps"] = total_steps
-        metrics["input_tokens_estimate"] = input_tokens
-        metrics["output_tokens_estimate"] = output_tokens
-        metrics["total_tokens_estimate"] = input_tokens + output_tokens
-        metrics["estimated_cost_usd"] = round(est_cost, 4)
-        metrics["tool_calls_breakdown"] = tool_counts
-    except Exception as e:
-        logger.debug("Failed parsing transcript for telemetry metrics: %s", e)
-
-    return metrics
+    return _agy_extract_session_transcript_metrics(
+        conv_id=conv_id,
+        brain_dir=CLI_BRAIN_DIR,
+    )
 
 
 def record_daemon_metrics(record: dict[str, Any]) -> None:
@@ -941,46 +456,10 @@ def record_daemon_metrics(record: dict[str, Any]) -> None:
 
 def extract_latest_agent_summary(conv_id: str | None = None) -> str | None:
     """Extract the concluding planner response from the latest session transcript."""
-    candidate_paths: list[Path] = []
-    if conv_id:
-        candidate_paths.extend(
-            [
-                CLI_BRAIN_DIR / conv_id / ".system_generated" / "logs" / "transcript_full.jsonl",
-                CLI_BRAIN_DIR / conv_id / ".system_generated" / "logs" / "transcript.jsonl",
-            ]
-        )
-
-    if CLI_BRAIN_DIR.is_dir():
-        for p in sorted(
-            CLI_BRAIN_DIR.glob("*/.system_generated/logs/transcript*.jsonl"),
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        ):
-            candidate_paths.append(p)
-
-    target_file = next((p for p in candidate_paths if p.is_file()), None)
-    if not target_file:
-        return None
-
-    try:
-        last_response: str | None = None
-        with target_file.open("r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line_str = line.strip()
-                if not line_str:
-                    continue
-                try:
-                    data = json.loads(line_str)
-                    if data.get("source") == "MODEL" and data.get("type") == "PLANNER_RESPONSE":
-                        content = data.get("content")
-                        if content and isinstance(content, str) and content.strip():
-                            last_response = content.strip()
-                except Exception:
-                    continue
-        return last_response
-    except Exception as e:
-        logger.debug("Failed extracting latest agent summary from transcript: %s", e)
-        return None
+    return _agy_extract_latest_agent_summary(
+        conv_id=conv_id,
+        brain_dir=CLI_BRAIN_DIR,
+    )
 
 
 def prompt_user_permission_action(
@@ -1631,104 +1110,11 @@ def get_session_transcript_status(
     since_timestamp: float = 0.0,
 ) -> tuple[int | str, str] | None:
     """Read the latest step from transcript.jsonl for real-time progress reporting."""
-    candidate_paths: list[Path] = []
-    if conv_id:
-        candidate_paths.append(
-            CLI_BRAIN_DIR / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
-        )
-
-    # Fallback to most recently updated transcript if conv_id not yet known
-    has_valid_path = bool(candidate_paths and any(p.exists() for p in candidate_paths))
-    if not has_valid_path and CLI_BRAIN_DIR.is_dir():
-        recent = sorted(
-            CLI_BRAIN_DIR.glob("*/.system_generated/logs/transcript.jsonl"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if recent:
-            candidate_paths.append(recent[0])
-
-    target_file = next((p for p in candidate_paths if p.exists()), None)
-    if not target_file:
-        return None
-    if since_timestamp > 0:
-        with contextlib.suppress(OSError):
-            if target_file.stat().st_mtime < (since_timestamp - 2.0):
-                return None
-
-    try:
-        with target_file.open("rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            seek_pos = max(0, size - 8192)
-            f.seek(seek_pos)
-            chunk = f.read().decode("utf-8", errors="ignore")
-
-        lines = [line.strip() for line in chunk.strip().split("\n") if line.strip()]
-        if not lines:
-            return None
-
-        for raw_line in reversed(lines):
-            try:
-                data = json.loads(raw_line)
-            except Exception:
-                continue
-
-            if since_timestamp > 0:
-                step_ts = parse_iso_timestamp(data.get("created_at"))
-                if step_ts is not None and step_ts < (since_timestamp - 2.0):
-                    break
-
-            step_idx = data.get("step_index", "?")
-            step_type = data.get("type", "UNKNOWN")
-
-            if data.get("tool_calls"):
-                tc = data["tool_calls"][0]
-                fn = tc.get("function", {})
-                name = fn.get("name") or tc.get("name") or "tool"
-                args = fn.get("arguments") or tc.get("args") or {}
-                if isinstance(args, str):
-                    with contextlib.suppress(Exception):
-                        args = json.loads(args)
-                action = args.get("toolAction") or args.get("toolSummary") or ""
-                cmd = args.get("CommandLine") or args.get("command") or ""
-                target_file_arg = (
-                    args.get("TargetFile") or args.get("AbsolutePath") or args.get("path") or ""
-                )
-
-                if action:
-                    return step_idx, f"Tool {name}: {action}"
-                if cmd:
-                    clean_cmd = str(cmd).strip().replace("\n", " ")
-                    if len(clean_cmd) > 50:
-                        clean_cmd = clean_cmd[:47] + "..."
-                    return step_idx, f"Tool {name}: `{clean_cmd}`"
-                if target_file_arg:
-                    file_name = Path(target_file_arg).name
-                    return step_idx, f"Tool {name}: {file_name}"
-                return step_idx, f"Tool: {name}"
-
-            if step_type == "PLANNER_RESPONSE":
-                content = (data.get("content") or "").strip()
-                if content:
-                    first_line = content.split("\n")[0].strip()
-                    if len(first_line) > 60:
-                        first_line = first_line[:57] + "..."
-                    return step_idx, f"Gemini: {first_line}"
-                return step_idx, "Gemini thinking / reasoning..."
-
-            if step_type == "GENERIC":
-                return step_idx, "Tool finished, processing output..."
-
-            if step_type == "SYSTEM_MESSAGE":
-                return step_idx, "Task update received, reasoning..."
-
-            if step_type == "USER_INPUT":
-                return step_idx, "Prompt received, starting turn..."
-
-        return None
-    except Exception:
-        return None
+    return _agy_get_session_transcript_status(
+        conv_id,
+        since_timestamp=since_timestamp,
+        brain_dir=CLI_BRAIN_DIR,
+    )
 
 
 def extract_previous_cumulative_time(log_file: Path) -> float:
@@ -1909,40 +1295,7 @@ def run_session_process(
     return proc.returncode, "".join(session_output)
 
 
-NETWORK_AND_TRANSIENT_PATTERNS: list[tuple[str, str]] = [
-    ("can't assign requested address", "Network interface down / unassigned address"),
-    ("network is down", "Network down"),
-    ("network is unreachable", "Network unreachable"),
-    ("network unreachable", "Network unreachable"),
-    ("no route to host", "No route to host"),
-    ("connection reset", "Connection reset"),
-    ("connection refused", "Connection refused"),
-    ("broken pipe", "Broken pipe"),
-    ("socket is not connected", "Socket not connected"),
-    ("i/o timeout", "I/O timeout"),
-    ("tls handshake timeout", "TLS handshake timeout"),
-    ("context deadline exceeded", "Context deadline exceeded"),
-    ("client.timeout", "Client timeout"),
-    ("deadline_exceeded", "Deadline exceeded"),
-    ("timed out", "Timeout"),
-    ("temporary failure in name resolution", "DNS resolution failure"),
-    ("nodename nor servname provided", "DNS lookup failure"),
-    ("no such host", "DNS host lookup failure"),
-    ("dial tcp", "TCP dial failure"),
-    ("read tcp", "TCP read failure"),
-    ("write tcp", "TCP write failure"),
-    ("stream error", "Stream error"),
-    ("streamgeneratecontent", "Stream generation error"),
-    ("request failed", "API request failed"),
-    ("eoferror", "EOF error"),
-    ("unexpected eof", "Unexpected EOF"),
-    ("internal (code 500)", "Internal error (code 500)"),
-    ("unavailable (code 503)", "Service unavailable (code 503)"),
-    ("resource_exhausted", "Resource exhausted (rate limit)"),
-    ("improperly formatted function call", "Improperly formatted tool function call"),
-    ("improperly formatted", "Improperly formatted tool call"),
-    ("malformed function call", "Malformed tool function call"),
-]
+NETWORK_AND_TRANSIENT_PATTERNS: list[tuple[str, str]] = list(_AGY_NETWORK_AND_TRANSIENT_PATTERNS)
 
 
 def check_network_connectivity(timeout: float = 3.0) -> bool:
@@ -2012,38 +1365,7 @@ def wait_for_network_connectivity(
 
 def is_transient_session_error(full_output: str, returncode: int) -> tuple[bool, str]:
     """Check if session failed due to a transient API, HTTP, or network error."""
-    full_lower = full_output.lower()
-
-    # 1. Check AGY_ERROR JSON payload
-    match = re.search(r"AGY_ERROR:\s*(\{.*?\})", full_output)
-    if match:
-        try:
-            err_data = json.loads(match.group(1))
-            code = err_data.get("error_code")
-            status = str(err_data.get("status") or "").upper()
-            kind = err_data.get("code_kind")
-            short_err = str(err_data.get("short_error") or "")
-            short_lower = short_err.lower()
-
-            if (
-                code in (429, 500, 502, 503, 504)
-                or status in ("INTERNAL", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "DEADLINE_EXCEEDED")
-                or kind == "http"
-            ):
-                return True, short_err or f"API error {code} ({status})"
-
-            for pattern, desc in NETWORK_AND_TRANSIENT_PATTERNS:
-                if pattern in short_lower:
-                    return True, desc
-        except Exception:
-            pass
-
-    # 2. Check full output for known network/transient error patterns
-    for pattern, desc in NETWORK_AND_TRANSIENT_PATTERNS:
-        if pattern in full_lower:
-            return True, desc
-
-    return False, ""
+    return _agy_is_transient_session_error(full_output, returncode)
 
 
 def execute_prompt_session(
