@@ -49,7 +49,7 @@ CODEX_INPUT_COST_PER_MILLION = 2.00
 CODEX_CACHED_COST_PER_MILLION = 0.50
 CODEX_OUTPUT_COST_PER_MILLION = 8.00
 
-# Known UUID mapping for foundational pair-programming sessions (0001-0007)
+# Known UUID mapping for foundational pair-programming sessions (0001-0008)
 FOUNDATIONAL_SESSIONS: dict[str, str] = {
     "99c957ab-37b8-408c-9983-01a771c34c8f": "0001",
     "4dbfff7c-1f1f-4f27-9c28-c15b8f88fd3d": "0002",
@@ -58,6 +58,7 @@ FOUNDATIONAL_SESSIONS: dict[str, str] = {
     "3487dfb2-2e6e-4302-aefa-68d618429292": "0005",
     "65e9c037-daad-4db6-a82b-5ed0157db297": "0006",
     "833a355e-f199-4bd8-a57a-761d36be8f42": "0007",
+    "ccd6d114-2b66-4ace-b874-f33832bfd63e": "0008",
 }
 
 

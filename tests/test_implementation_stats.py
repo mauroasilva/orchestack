@@ -304,7 +304,7 @@ def test_repository_implementation_stats_doc_exists_and_has_phases_0001_to_0007(
     assert "| **Total** |" in content
 
     parsed = parse_existing_implementation_stats(stats_path)
-    for phase_num in ("0001", "0002", "0003", "0004", "0005", "0006", "0007"):
+    for phase_num in ("0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008"):
         assert phase_num in parsed, f"Phase {phase_num} missing from docs/IMPLEMENTATION_STATS.md"
         assert parsed[phase_num].duration_seconds > 0
         assert parsed[phase_num].total_tokens > 0
