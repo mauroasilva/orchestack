@@ -63,6 +63,7 @@ from orchestack.telemetry.reporter import (  # noqa: E402
     parse_claude_events_telemetry,
     parse_codex_events_telemetry,
     parse_daemon_log_file,
+    update_implementation_stats,
 )
 
 CLAUDE_PROJECTS_DIR = DEFAULT_CLAUDE_PROJECTS_DIR
@@ -631,7 +632,32 @@ def main() -> None:
         action="store_true",
         help="Print summary in CSV format.",
     )
+    parser.add_argument(
+        "--update-stats",
+        action="store_true",
+        help="Update docs/IMPLEMENTATION_STATS.md with aggregated per-phase implementation stats.",
+    )
+    parser.add_argument(
+        "--stats-file",
+        type=Path,
+        default=None,
+        help="Optional output path for IMPLEMENTATION_STATS.md when using --update-stats.",
+    )
     args = parser.parse_args()
+
+    if args.update_stats or args.stats_file is not None:
+        repo_path = (args.repo or REPO_ROOT).resolve()
+        stats_target = args.stats_file.expanduser().resolve() if args.stats_file else None
+        written = update_implementation_stats(repo_root=repo_path, output_path=stats_target)
+        if (
+            args.format is None
+            and args.output is None
+            and not args.json
+            and not args.markdown
+            and not args.csv
+        ):
+            print(f"Updated implementation stats at {written}")
+            return
 
     if args.format is not None or args.repo is not None or args.output is not None:
         repo_path = (args.repo or REPO_ROOT).resolve()

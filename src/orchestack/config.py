@@ -187,6 +187,10 @@ class RepoConfig:
         return self.repo_root / "docs" / "PR_DESCRIPTION.md"
 
     @property
+    def implementation_stats_path(self) -> Path:
+        return self.repo_root / "docs" / "IMPLEMENTATION_STATS.md"
+
+    @property
     def daemon_dir(self) -> Path:
         return self.repo_root / ".daemon"
 

@@ -32,10 +32,12 @@ from orchestack.forge.detect import (
     parse_git_remote,
 )
 from orchestack.telemetry.reporter import (
+    TelemetryReport,
     build_canonical_slug_map,
     collect_multi_agent_telemetry,
     format_telemetry_json,
     format_telemetry_markdown,
+    update_implementation_stats,
 )
 
 app = typer.Typer(
@@ -873,6 +875,20 @@ def telemetry_cmd_entry(
         bool,
         typer.Option("--json", help="Shorthand for --format json."),
     ] = False,
+    update_stats: Annotated[
+        bool,
+        typer.Option(
+            "--update-stats",
+            help="Update docs/IMPLEMENTATION_STATS.md with per-phase implementation stats.",
+        ),
+    ] = False,
+    stats_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--stats-file",
+            help="Optional destination path when updating implementation stats.",
+        ),
+    ] = None,
 ) -> None:
     """Generate unified session telemetry across Antigravity, Claude Code, and Codex."""
     target_root = (repo if repo is not None else Path.cwd()).expanduser().resolve()
@@ -885,6 +901,21 @@ def telemetry_cmd_entry(
 
     slug_map = build_canonical_slug_map(target_root)
     all_sessions, by_prompt = collect_multi_agent_telemetry(repo_root=target_root)
+
+    if update_stats or stats_file is not None:
+        resolved_stats_file = stats_file.expanduser().resolve() if stats_file is not None else None
+        written_stats_path = update_implementation_stats(
+            repo_root=target_root,
+            output_path=resolved_stats_file,
+            report=TelemetryReport(
+                sessions=all_sessions,
+                by_prompt=by_prompt,
+                slug_map=slug_map,
+            ),
+        )
+        if output is None and not as_json and output_format == "markdown":
+            typer.echo(f"Implementation stats written to {written_stats_path}")
+            return
 
     if fmt == "json":
         rendered = format_telemetry_json(all_sessions, by_prompt, slug_map)

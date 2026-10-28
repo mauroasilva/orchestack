@@ -102,6 +102,9 @@ from orchestack.forge.github import (  # noqa: E402
 from orchestack.forge.github import (  # noqa: E402
     is_ci_billing_or_quota_failure as _forge_is_ci_billing_or_quota_failure,
 )
+from orchestack.telemetry.reporter import (  # noqa: E402
+    update_implementation_stats,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_REPO_ROOT = REPO_ROOT
@@ -111,12 +114,15 @@ LEARNINGS_DIR = REPO_ROOT / "docs" / "learnings"
 _DEFAULT_LEARNINGS_DIR = LEARNINGS_DIR
 PR_DESC_PATH = REPO_ROOT / "docs" / "PR_DESCRIPTION.md"
 _DEFAULT_PR_DESC_PATH = PR_DESC_PATH
+IMPLEMENTATION_STATS_PATH = REPO_ROOT / "docs" / "IMPLEMENTATION_STATS.md"
+_DEFAULT_IMPLEMENTATION_STATS_PATH = IMPLEMENTATION_STATS_PATH
 DAEMON_DIR = REPO_ROOT / ".daemon"
 LOCK_FILE = DAEMON_DIR / "daemon.lock"
 REVIEW_STATE_FILE = DAEMON_DIR / "review_state.json"
 LOGS_DIR = REPO_ROOT / "logs"
 PR_REVIEWS_FILE = LOGS_DIR / "pr_reviews.json"
 DAEMON_METRICS_FILE = LOGS_DIR / "daemon_metrics.jsonl"
+_DEFAULT_DAEMON_METRICS_FILE = DAEMON_METRICS_FILE
 BASE_BRANCH = "main"
 BRANCH_PREFIX = "gemini"
 CHECK_CMD = "make check"
@@ -216,6 +222,7 @@ logger = logging.getLogger("bth-daemon")
 def configure_runtime(config: RepoConfig) -> RepoConfig:
     """Rebind module-level repository paths and settings from a `RepoConfig`."""
     global REPO_ROOT, QUEUED_DIR, IMPLEMENTED_DIR, LEARNINGS_DIR, PR_DESC_PATH
+    global IMPLEMENTATION_STATS_PATH
     global DAEMON_DIR, LOCK_FILE, REVIEW_STATE_FILE, LOGS_DIR, PR_REVIEWS_FILE
     global DAEMON_METRICS_FILE, BASE_BRANCH, BRANCH_PREFIX, CHECK_CMD
     global REQUIRE_LEARNINGS, REQUIRE_PR_DESCRIPTION, ACTIVE_CONFIG
@@ -225,6 +232,7 @@ def configure_runtime(config: RepoConfig) -> RepoConfig:
     IMPLEMENTED_DIR = config.implemented_dir
     LEARNINGS_DIR = config.learnings_dir
     PR_DESC_PATH = config.pr_description_path
+    IMPLEMENTATION_STATS_PATH = config.implementation_stats_path
     DAEMON_DIR = config.daemon_dir
     LOCK_FILE = config.lock_file
     REVIEW_STATE_FILE = config.review_state_file
@@ -441,6 +449,54 @@ def extract_session_transcript_metrics(conv_id: str | None = None) -> dict[str, 
     )
 
 
+def refresh_implementation_stats() -> Path | None:
+    """Update `docs/IMPLEMENTATION_STATS.md` from collected session and daemon telemetry."""
+    if (
+        os.environ.get("PYTEST_CURRENT_TEST")
+        and REPO_ROOT == _DEFAULT_REPO_ROOT
+        and IMPLEMENTATION_STATS_PATH == _DEFAULT_IMPLEMENTATION_STATS_PATH
+        and DAEMON_METRICS_FILE == _DEFAULT_DAEMON_METRICS_FILE
+    ):
+        return None
+
+    try:
+        if IMPLEMENTATION_STATS_PATH != _DEFAULT_IMPLEMENTATION_STATS_PATH:
+            target_stats_path = IMPLEMENTATION_STATS_PATH
+        elif REPO_ROOT != _DEFAULT_REPO_ROOT:
+            target_stats_path = REPO_ROOT / "docs" / "IMPLEMENTATION_STATS.md"
+        else:
+            target_stats_path = IMPLEMENTATION_STATS_PATH
+
+        log_dirs = [
+            DAEMON_METRICS_FILE.parent,
+            REPO_ROOT / ".daemon" / "logs",
+            REPO_ROOT / ".daemon",
+            LOGS_DIR,
+        ]
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            empty_dir = DAEMON_METRICS_FILE.parent / "_empty_telemetry_home"
+            return update_implementation_stats(
+                repo_root=REPO_ROOT,
+                output_path=target_stats_path,
+                agy_cli_brain_dir=CLI_BRAIN_DIR
+                if CLI_BRAIN_DIR != CLI_DIR / "brain"
+                else empty_dir,
+                agy_ide_brain_dir=empty_dir,
+                agy_summaries_dbs=(),
+                claude_projects_dir=empty_dir,
+                codex_sessions_dir=empty_dir,
+                daemon_logs_dirs=log_dirs,
+            )
+        return update_implementation_stats(
+            repo_root=REPO_ROOT,
+            output_path=target_stats_path,
+            daemon_logs_dirs=log_dirs,
+        )
+    except Exception as e:
+        logger.warning("Could not refresh implementation stats: %s", e)
+        return None
+
+
 def record_daemon_metrics(record: dict[str, Any]) -> None:
     """Append a structured metrics event to logs/daemon_metrics.jsonl."""
     try:
@@ -456,6 +512,7 @@ def record_daemon_metrics(record: dict[str, Any]) -> None:
             record.get("total_tokens_estimate", 0),
             record.get("estimated_cost_usd", 0.0),
         )
+        refresh_implementation_stats()
     except Exception as e:
         logger.warning("Could not append to %s: %s", DAEMON_METRICS_FILE, e)
 
@@ -3712,7 +3769,8 @@ def main() -> None:
             )
             sys.exit(1)
 
-        # Step 6: Verify commit count and auto-commit validated changes if needed
+        # Step 6: Refresh implementation stats, verify commit count, and auto-commit if needed
+        refresh_implementation_stats()
         new_commits = count_new_commits(branch_name)
 
         if new_commits == 0:

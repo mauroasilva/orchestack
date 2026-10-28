@@ -49,7 +49,7 @@ CODEX_INPUT_COST_PER_MILLION = 2.00
 CODEX_CACHED_COST_PER_MILLION = 0.50
 CODEX_OUTPUT_COST_PER_MILLION = 8.00
 
-# Known UUID mapping for foundational pair-programming sessions (0001-0006)
+# Known UUID mapping for foundational pair-programming sessions (0001-0007)
 FOUNDATIONAL_SESSIONS: dict[str, str] = {
     "99c957ab-37b8-408c-9983-01a771c34c8f": "0001",
     "4dbfff7c-1f1f-4f27-9c28-c15b8f88fd3d": "0002",
@@ -57,6 +57,7 @@ FOUNDATIONAL_SESSIONS: dict[str, str] = {
     "c38d200c-d369-4aa1-875c-08b23b750ed3": "0004",
     "3487dfb2-2e6e-4302-aefa-68d618429292": "0005",
     "65e9c037-daad-4db6-a82b-5ed0157db297": "0006",
+    "833a355e-f199-4bd8-a57a-761d36be8f42": "0007",
 }
 
 
@@ -130,11 +131,13 @@ def build_canonical_slug_map(
     *,
     implemented_dir: Path | None = None,
     queued_dir: Path | None = None,
+    plan_path: Path | None = None,
 ) -> dict[str, str]:
     """Return mapping of 4-digit prompt numbers (`'0001'`) to prompt slug stems."""
     root = (repo_root or Path.cwd()).resolve()
     impl_dir = implemented_dir if implemented_dir is not None else root / "prompts" / "implemented"
     q_dir = queued_dir if queued_dir is not None else root / "prompts" / "queued"
+    p_path = plan_path if plan_path is not None else root / "docs" / "PLAN.md"
 
     slug_map: dict[str, str] = {}
     for p_dir in (impl_dir, q_dir):
@@ -143,6 +146,23 @@ def build_canonical_slug_map(
                 m = re.match(r"^(\d{4})-(.*)", f.stem)
                 if m:
                     slug_map[m.group(1)] = f.stem
+
+    if p_path.is_file():
+        try:
+            plan_text = p_path.read_text(encoding="utf-8", errors="replace")
+            for line in plan_text.splitlines():
+                m_plan = re.match(r"^\|\s*`?(\d{4})`?\s*\|\s*`?([a-zA-Z0-9_-]+)`?\s*\|", line)
+                if m_plan:
+                    pnum = m_plan.group(1)
+                    raw_slug = m_plan.group(2)
+                    if pnum not in slug_map:
+                        full_slug = (
+                            raw_slug if raw_slug.startswith(f"{pnum}-") else f"{pnum}-{raw_slug}"
+                        )
+                        slug_map[pnum] = full_slug
+        except OSError:
+            pass
+
     return slug_map
 
 
@@ -166,9 +186,17 @@ def infer_prompt_num(
         if m_src:
             return m_src.group(1)
 
+    combined_all = f"{combined_user} {combined_sample}"
+    if (
+        "blueteamharness" in combined_all.lower()
+        and "orchestack" not in combined_all.lower()
+        and conv_id not in FOUNDATIONAL_SESSIONS
+    ):
+        return None
+
     # 3. Explicit daemon prompt kickoff in user messages
     m_p = re.search(
-        r"(?:Orchestack|BlueTeamHarness)\s*[-—]+\s*Prompt\s+(\d{4})",
+        r"Orchestack\s*[-—]+\s*Prompt\s+(\d{4})",
         combined_user,
         re.IGNORECASE,
     )
@@ -181,7 +209,6 @@ def infer_prompt_num(
         return m_q.group(1)
 
     # 5. Explicit branch in user messages or thinking
-    combined_all = f"{combined_user} {combined_sample}"
     m_b = re.search(
         r"branch\s+['\"]?(?:gemini|orchestack|prompt|claude|codex|agy)/(\d{4})-",
         combined_all,
@@ -200,37 +227,67 @@ def infer_prompt_num(
         m_t = re.search(r"(?:Prompt|^#?\s*)(\d{4})\b", title, re.IGNORECASE)
         if m_t:
             cand = m_t.group(1)
-            if cand != "0007" or "0007" in combined_all:
+            if (not slug_map or cand in slug_map) and (cand != "0007" or "0007" in combined_all):
                 return cand
 
     return None
 
 
 def _compute_duration_from_timestamps(timestamps: Sequence[str]) -> float:
-    """Compute elapsed seconds between first and last ISO-8601 timestamps."""
+    """Compute active elapsed seconds across ISO-8601 step timestamps, excluding long idle gaps."""
     if len(timestamps) < 2:
         return 0.0
-    try:
-        t0_str = timestamps[0].strip()
-        t1_str = timestamps[-1].strip()
-        if t0_str.endswith("Z"):
-            t0_str = t0_str[:-1] + "+00:00"
-        if t1_str.endswith("Z"):
-            t1_str = t1_str[:-1] + "+00:00"
-        t0 = datetime.datetime.fromisoformat(t0_str)
-        t1 = datetime.datetime.fromisoformat(t1_str)
-        if t0.tzinfo is None:
-            t0 = t0.replace(tzinfo=datetime.UTC)
-        if t1.tzinfo is None:
-            t1 = t1.replace(tzinfo=datetime.UTC)
-        return max(0.0, (t1 - t0).total_seconds())
-    except Exception:
+    parsed: list[datetime.datetime] = []
+    for raw in timestamps:
+        s = raw.strip()
+        if not s:
+            continue
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.UTC)
+            parsed.append(dt)
+        except Exception:
+            continue
+    if len(parsed) < 2:
         return 0.0
+    if len(parsed) == 2:
+        return max(0.0, (parsed[1] - parsed[0]).total_seconds())
+    active_seconds = 0.0
+    for i in range(1, len(parsed)):
+        delta = (parsed[i] - parsed[i - 1]).total_seconds()
+        if 0.0 <= delta <= 1800.0:
+            active_seconds += delta
+    if active_seconds > 0.0:
+        return active_seconds
+    return max(0.0, (parsed[-1] - parsed[0]).total_seconds())
 
 
 # ---------------------------------------------------------------------------
 # 1. Antigravity (`agy`) Telemetry
 # ---------------------------------------------------------------------------
+
+
+def _register_antigravity_transcript(
+    sessions: dict[str, dict[str, Any]],
+    conv_id: str,
+    t_path: Path,
+) -> None:
+    if conv_id not in sessions:
+        sessions[conv_id] = {"full": None, "compact": None, "mtime": 0.0}
+
+    if t_path.name == "transcript_full.jsonl":
+        sessions[conv_id]["full"] = t_path
+    elif t_path.name == "transcript.jsonl":
+        sessions[conv_id]["compact"] = t_path
+
+    try:
+        mtime = t_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    sessions[conv_id]["mtime"] = max(float(sessions[conv_id]["mtime"]), mtime)
 
 
 def discover_antigravity_sessions(
@@ -241,23 +298,31 @@ def discover_antigravity_sessions(
     sessions: dict[str, dict[str, Any]] = {}
 
     for bdir in (cli_brain_dir, ide_brain_dir):
-        if not bdir.is_dir():
+        try:
+            if not bdir.is_dir():
+                continue
+        except OSError:
             continue
-        for t_path in bdir.glob("*/.system_generated/logs/transcript*.jsonl"):
-            conv_id = t_path.parent.parent.parent.name
-            if conv_id not in sessions:
-                sessions[conv_id] = {"full": None, "compact": None, "mtime": 0.0}
+        try:
+            for t_path in bdir.glob("*/.system_generated/logs/transcript*.jsonl"):
+                conv_id = t_path.parent.parent.parent.name
+                _register_antigravity_transcript(sessions, conv_id, t_path)
+        except OSError:
+            pass
 
-            if t_path.name == "transcript_full.jsonl":
-                sessions[conv_id]["full"] = t_path
-            elif t_path.name == "transcript.jsonl":
-                sessions[conv_id]["compact"] = t_path
-
-            try:
-                mtime = t_path.stat().st_mtime
-            except OSError:
-                mtime = 0.0
-            sessions[conv_id]["mtime"] = max(float(sessions[conv_id]["mtime"]), mtime)
+        # Direct path lookup fallback when directory listing on `bdir` is restricted by sandbox
+        if bdir in {CLI_BRAIN_DIR, IDE_BRAIN_DIR}:
+            for conv_id in FOUNDATIONAL_SESSIONS:
+                if conv_id in sessions:
+                    continue
+                logs_dir = bdir / conv_id / ".system_generated" / "logs"
+                for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+                    cand = logs_dir / fname
+                    try:
+                        if cand.is_file():
+                            _register_antigravity_transcript(sessions, conv_id, cand)
+                    except OSError:
+                        continue
 
     return sessions
 
@@ -404,7 +469,7 @@ def parse_antigravity_transcript(
                     cached_tokens += cache_t
                     output_tokens += out_t
                 else:
-                    if step_type in ("USER_INPUT", "SYSTEM_MESSAGE"):
+                    if step_type in ("USER_INPUT", "SYSTEM_MESSAGE", "GENERIC", "CHECKPOINT"):
                         input_tokens += max(1, len(content) // 4)
                     elif step_type == "PLANNER_RESPONSE":
                         output_tokens += max(1, (len(content) + len(thinking)) // 4)
@@ -426,6 +491,8 @@ def parse_antigravity_transcript(
                     )
                     input_tokens += len(str(args)) // 4
 
+    except PermissionError:
+        return None
     except Exception as e:
         print(f"Warning: error reading {target_file}: {e}", file=sys.stderr)
         return None
@@ -730,10 +797,14 @@ def discover_claude_sessions(
 ) -> list[SessionTelemetry]:
     """Discover and parse all Claude Code `.jsonl` transcripts under `~/.claude/projects`."""
     results: list[SessionTelemetry] = []
-    if not claude_projects_dir.is_dir():
+    try:
+        if not claude_projects_dir.is_dir():
+            return results
+        paths = sorted(claude_projects_dir.glob("**/*.jsonl"))
+    except OSError:
         return results
 
-    for jsonl_path in sorted(claude_projects_dir.glob("**/*.jsonl")):
+    for jsonl_path in paths:
         telemetry = parse_claude_session_file(jsonl_path, slug_map=slug_map)
         if telemetry is not None:
             results.append(telemetry)
@@ -975,13 +1046,23 @@ def discover_codex_sessions(
 ) -> list[SessionTelemetry]:
     """Discover and parse all Codex `rollout-*.jsonl` files under `~/.codex/sessions`."""
     results: list[SessionTelemetry] = []
-    if not codex_sessions_dir.is_dir():
+    try:
+        if not codex_sessions_dir.is_dir():
+            return results
+    except OSError:
         return results
 
     seen_paths: set[Path] = set()
     for pattern in ("**/rollout-*.jsonl", "**/*.jsonl"):
-        for jsonl_path in sorted(codex_sessions_dir.glob(pattern)):
-            resolved = jsonl_path.resolve()
+        try:
+            paths = sorted(codex_sessions_dir.glob(pattern))
+        except OSError:
+            continue
+        for jsonl_path in paths:
+            try:
+                resolved = jsonl_path.resolve()
+            except OSError:
+                continue
             if resolved in seen_paths:
                 continue
             seen_paths.add(resolved)
@@ -1004,7 +1085,7 @@ def parse_daemon_log_file(
     if not file_path.is_file():
         return []
 
-    if file_path.name == "daemon_metrics.jsonl":
+    if file_path.name in {"daemon_metrics.jsonl", "metrics.jsonl"}:
         records: list[SessionTelemetry] = []
         try:
             raw_lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -1463,3 +1544,478 @@ def backfill_daemon_metrics_file(
             backfilled_count += 1
 
     return backfilled_count
+
+
+# ---------------------------------------------------------------------------
+# 6. Phase Implementation Statistics (`docs/IMPLEMENTATION_STATS.md`)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PhaseImplementationStats:
+    """Aggregated implementation time and token cost for a single phase."""
+
+    phase_num: str
+    phase_slug: str
+    sessions_count: int = 0
+    duration_seconds: float = 0.0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+
+
+@dataclass
+class TelemetryReport:
+    """Structured multi-agent telemetry report across all discovered sessions and phases."""
+
+    sessions: list[SessionTelemetry] = field(default_factory=list)
+    by_prompt: dict[str, list[SessionTelemetry]] = field(default_factory=dict)
+    slug_map: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.by_prompt and self.sessions:
+            grouped: dict[str, list[SessionTelemetry]] = {}
+            for sess in self.sessions:
+                if sess.prompt_num:
+                    grouped.setdefault(sess.prompt_num, []).append(sess)
+            self.by_prompt = grouped
+
+
+def format_duration(seconds: float) -> str:
+    """Format duration in seconds into human-readable `Xs`, `Xm Ys`, or `Xh Ym Zs`."""
+    total_seconds = max(0, round(seconds))
+    if total_seconds < 60:
+        return f"{total_seconds}s"
+    if total_seconds < 3600:
+        mins, secs = divmod(total_seconds, 60)
+        return f"{mins}m {secs}s"
+    hours, rem = divmod(total_seconds, 3600)
+    mins, secs = divmod(rem, 60)
+    return f"{hours}h {mins}m {secs}s"
+
+
+def parse_duration_str(text: str) -> float:
+    """Parse a human-readable duration cell (`1h 2m 3s`, `18m 55s`, `45s`) back into seconds."""
+    cleaned = text.strip().replace("*", "")
+    if not cleaned:
+        return 0.0
+
+    m_raw = re.search(r"\(([0-9,]+(?:\.[0-9]+)?)\s*s\)", cleaned)
+    if m_raw:
+        try:
+            return float(m_raw.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    total = 0.0
+    matched = False
+    for unit_pattern, multiplier in (
+        (r"([0-9]+(?:\.[0-9]+)?)\s*h", 3600.0),
+        (r"([0-9]+(?:\.[0-9]+)?)\s*m", 60.0),
+        (r"([0-9]+(?:\.[0-9]+)?)\s*s", 1.0),
+    ):
+        m_u = re.search(unit_pattern, cleaned, re.IGNORECASE)
+        if m_u:
+            try:
+                total += float(m_u.group(1)) * multiplier
+                matched = True
+            except ValueError:
+                pass
+    if matched:
+        return total
+
+    try:
+        return float(cleaned.replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
+def parse_existing_implementation_stats(
+    stats_source: Path | str,
+) -> dict[str, PhaseImplementationStats]:
+    """Parse existing phase rows from `docs/IMPLEMENTATION_STATS.md` content or file path."""
+    if isinstance(stats_source, Path):
+        if not stats_source.is_file():
+            return {}
+        try:
+            raw_text = stats_source.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return {}
+    else:
+        raw_text = stats_source
+
+    parsed: dict[str, PhaseImplementationStats] = {}
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or not stripped.endswith("|"):
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        phase_cell, time_cell, cost_cell = cells[0], cells[1], cells[2]
+        if (
+            not phase_cell
+            or phase_cell.lower() == "phase"
+            or "total" in phase_cell.lower()
+            or set(phase_cell) <= {":", "-", " "}
+        ):
+            continue
+
+        clean_phase = phase_cell.strip("`* ")
+        m_phase = re.match(r"^(\d{4})(?:-(.+))?$", clean_phase)
+        if not m_phase:
+            continue
+        pnum = m_phase.group(1)
+        pslug = clean_phase if m_phase.group(2) else f"prompt-{pnum}"
+
+        dur_s = parse_duration_str(time_cell)
+
+        cost_usd = 0.0
+        m_cost = re.search(r"\$([0-9,]+(?:\.[0-9]+)?)", cost_cell)
+        if m_cost:
+            try:
+                cost_usd = float(m_cost.group(1).replace(",", ""))
+            except ValueError:
+                cost_usd = 0.0
+
+        tot_tokens = 0
+        m_tok = re.search(r"([0-9,]+)\s*tokens?", cost_cell, re.IGNORECASE)
+        if m_tok:
+            try:
+                tot_tokens = int(m_tok.group(1).replace(",", ""))
+            except ValueError:
+                tot_tokens = 0
+
+        parsed[pnum] = PhaseImplementationStats(
+            phase_num=pnum,
+            phase_slug=pslug,
+            sessions_count=1 if (dur_s > 0 or tot_tokens > 0 or cost_usd > 0) else 0,
+            duration_seconds=dur_s,
+            total_tokens=tot_tokens,
+            estimated_cost_usd=cost_usd,
+        )
+
+    return parsed
+
+
+def _coerce_session_telemetry(item: SessionTelemetry | Mapping[str, Any]) -> SessionTelemetry:
+    if isinstance(item, SessionTelemetry):
+        return item
+    p_slug = str(item.get("prompt_slug") or "")
+    p_num = item.get("prompt_num")
+    if not p_num and p_slug:
+        m = re.match(r"^(\d{4})", p_slug)
+        if m:
+            p_num = m.group(1)
+    in_tok = int(item.get("input_tokens") or item.get("input_tokens_estimate") or 0)
+    cache_tok = int(item.get("cached_input_tokens") or 0)
+    out_tok = int(item.get("output_tokens") or item.get("output_tokens_estimate") or 0)
+    tot_tok = int(
+        item.get("total_tokens")
+        or item.get("total_tokens_estimate")
+        or (in_tok + cache_tok + out_tok)
+    )
+    return SessionTelemetry(
+        session_id=str(item.get("session_id") or item.get("conv_id") or "session"),
+        backend=str(item.get("backend") or "agy"),
+        model=str(item.get("model") or ""),
+        prompt_num=str(p_num) if p_num else None,
+        prompt_slug=p_slug,
+        total_steps=int(item.get("total_steps") or 0),
+        num_turns=int(item.get("num_turns") or item.get("total_steps") or 0),
+        input_tokens=in_tok,
+        cached_input_tokens=cache_tok,
+        output_tokens=out_tok,
+        total_tokens=tot_tok,
+        estimated_cost_usd=float(item.get("estimated_cost_usd") or 0.0),
+        duration_seconds=float(
+            item.get("duration_seconds") or item.get("session_duration_seconds") or 0.0
+        ),
+    )
+
+
+def _normalize_report_input(
+    report: (
+        TelemetryReport | Sequence[SessionTelemetry | Mapping[str, Any]] | Mapping[str, Any] | None
+    ),
+    repo_root: Path | None = None,
+    slug_map: Mapping[str, str] | None = None,
+) -> tuple[dict[str, list[SessionTelemetry]], dict[str, str]]:
+    effective_slug_map: dict[str, str] = {}
+    if repo_root is not None:
+        effective_slug_map.update(build_canonical_slug_map(repo_root))
+    if slug_map is not None:
+        effective_slug_map.update(slug_map)
+    has_canonical_slugs = bool(effective_slug_map)
+
+    by_prompt: dict[str, list[SessionTelemetry]] = {}
+
+    if report is None:
+        _, collected_by_prompt = collect_multi_agent_telemetry(repo_root=repo_root)
+        by_prompt = collected_by_prompt
+        if not effective_slug_map:
+            effective_slug_map.update(build_canonical_slug_map(repo_root))
+            has_canonical_slugs = bool(effective_slug_map)
+    elif isinstance(report, TelemetryReport):
+        if report.slug_map:
+            for k, v in report.slug_map.items():
+                effective_slug_map.setdefault(k, v)
+            has_canonical_slugs = bool(effective_slug_map)
+        for pnum, sess_list in report.by_prompt.items():
+            by_prompt[pnum] = [_coerce_session_telemetry(s) for s in sess_list]
+    elif isinstance(report, Mapping):
+        if "by_prompt" in report and isinstance(report["by_prompt"], Mapping):
+            for pnum, sess_list in report["by_prompt"].items():
+                if isinstance(sess_list, Sequence):
+                    by_prompt[str(pnum)] = [_coerce_session_telemetry(s) for s in sess_list]
+        elif "sessions" in report and isinstance(report["sessions"], Sequence):
+            for raw_s in report["sessions"]:
+                if isinstance(raw_s, (SessionTelemetry, Mapping)):
+                    s = _coerce_session_telemetry(raw_s)
+                    if s.prompt_num:
+                        by_prompt.setdefault(s.prompt_num, []).append(s)
+        else:
+            for pnum, val in report.items():
+                if isinstance(val, Sequence) and not isinstance(val, (str, bytes)):
+                    by_prompt[str(pnum)] = [_coerce_session_telemetry(s) for s in val]
+                elif isinstance(val, (SessionTelemetry, Mapping)):
+                    s = _coerce_session_telemetry(val)
+                    by_prompt.setdefault(str(pnum), []).append(s)
+    elif isinstance(report, Sequence):
+        for raw_s in report:
+            s = _coerce_session_telemetry(raw_s)
+            if s.prompt_num:
+                by_prompt.setdefault(s.prompt_num, []).append(s)
+
+    for pnum, sess_list in by_prompt.items():
+        if pnum not in effective_slug_map and sess_list:
+            first_slug = sess_list[0].prompt_slug
+            if has_canonical_slugs and (
+                not first_slug or first_slug.startswith("other-") or "-other-" in first_slug
+            ):
+                continue
+            if first_slug:
+                effective_slug_map[pnum] = (
+                    first_slug if first_slug.startswith(f"{pnum}-") else f"{pnum}-{first_slug}"
+                )
+            else:
+                effective_slug_map[pnum] = f"prompt-{pnum}"
+
+    return by_prompt, effective_slug_map
+
+
+def render_implementation_stats_markdown(
+    report: (
+        TelemetryReport | Sequence[SessionTelemetry | Mapping[str, Any]] | Mapping[str, Any] | None
+    ) = None,
+    repo_root: Path | None = None,
+    *,
+    existing_stats: Mapping[str, PhaseImplementationStats] | Path | str | None = None,
+    slug_map: Mapping[str, str] | None = None,
+) -> str:
+    """Render `docs/IMPLEMENTATION_STATS.md` with per-phase implementation time and token cost."""
+    by_prompt, effective_slug_map = _normalize_report_input(
+        report,
+        repo_root=repo_root,
+        slug_map=slug_map,
+    )
+
+    parsed_existing: dict[str, PhaseImplementationStats] = {}
+    if existing_stats is not None:
+        if isinstance(existing_stats, (Path, str)):
+            parsed_existing = parse_existing_implementation_stats(existing_stats)
+        else:
+            parsed_existing = dict(existing_stats)
+    elif repo_root is not None:
+        default_stats_file = repo_root / "docs" / "IMPLEMENTATION_STATS.md"
+        if default_stats_file.is_file():
+            parsed_existing = parse_existing_implementation_stats(default_stats_file)
+
+    for pnum, ex_stat in parsed_existing.items():
+        if (
+            pnum not in effective_slug_map
+            and ex_stat.phase_slug
+            and not ex_stat.phase_slug.startswith("prompt-")
+            and "-other-" not in ex_stat.phase_slug
+        ):
+            effective_slug_map[pnum] = ex_stat.phase_slug
+
+    implemented_pnums: set[str] = set()
+    if repo_root is not None:
+        impl_dir = repo_root / "prompts" / "implemented"
+        if impl_dir.is_dir():
+            for f in impl_dir.glob("*.md"):
+                m = re.match(r"^(\d{4})-", f.stem)
+                if m:
+                    implemented_pnums.add(m.group(1))
+
+    if effective_slug_map:
+        all_pnums = sorted(effective_slug_map.keys())
+    else:
+        all_pnums = sorted(set(by_prompt.keys()) | set(parsed_existing.keys()))
+
+    phase_rows: list[PhaseImplementationStats] = []
+    for pnum in all_pnums:
+        sessions = by_prompt.get(pnum, [])
+        ex = parsed_existing.get(pnum)
+        canonical_slug = effective_slug_map.get(
+            pnum,
+            ex.phase_slug
+            if ex is not None
+            else (sessions[0].prompt_slug if sessions else f"prompt-{pnum}"),
+        )
+
+        live_dur = sum(s.duration_seconds for s in sessions)
+        live_in = sum(s.input_tokens for s in sessions)
+        live_cache = sum(s.cached_input_tokens for s in sessions)
+        live_out = sum(s.output_tokens for s in sessions)
+        live_tokens = sum(s.total_tokens for s in sessions)
+        live_cost = sum(s.estimated_cost_usd for s in sessions)
+        has_live = bool(sessions) and (live_dur > 0 or live_tokens > 0 or live_cost > 0)
+        has_existing = ex is not None and (
+            ex.duration_seconds > 0 or ex.total_tokens > 0 or ex.estimated_cost_usd > 0
+        )
+
+        if (
+            not has_live
+            and not has_existing
+            and pnum not in implemented_pnums
+            and (by_prompt or parsed_existing or implemented_pnums)
+        ):
+            # Skip unimplemented future phases that have no recorded telemetry yet
+            continue
+
+        if has_existing and ex is not None:
+            if has_live and (
+                live_tokens > ex.total_tokens
+                or round(live_cost, 2) > round(ex.estimated_cost_usd, 2)
+                or (
+                    ex.total_tokens == 0
+                    and ex.estimated_cost_usd == 0
+                    and live_dur > ex.duration_seconds
+                )
+            ):
+                chosen = PhaseImplementationStats(
+                    phase_num=pnum,
+                    phase_slug=canonical_slug,
+                    sessions_count=len(sessions),
+                    duration_seconds=max(live_dur, ex.duration_seconds)
+                    if live_tokens == ex.total_tokens
+                    else live_dur,
+                    input_tokens=live_in,
+                    cached_input_tokens=live_cache,
+                    output_tokens=live_out,
+                    total_tokens=live_tokens,
+                    estimated_cost_usd=live_cost,
+                )
+            else:
+                chosen = PhaseImplementationStats(
+                    phase_num=pnum,
+                    phase_slug=canonical_slug,
+                    sessions_count=max(ex.sessions_count, len(sessions)),
+                    duration_seconds=ex.duration_seconds,
+                    input_tokens=ex.input_tokens,
+                    cached_input_tokens=ex.cached_input_tokens,
+                    output_tokens=ex.output_tokens,
+                    total_tokens=ex.total_tokens,
+                    estimated_cost_usd=ex.estimated_cost_usd,
+                )
+        else:
+            chosen = PhaseImplementationStats(
+                phase_num=pnum,
+                phase_slug=canonical_slug,
+                sessions_count=len(sessions),
+                duration_seconds=live_dur,
+                input_tokens=live_in,
+                cached_input_tokens=live_cache,
+                output_tokens=live_out,
+                total_tokens=live_tokens,
+                estimated_cost_usd=live_cost,
+            )
+
+        phase_rows.append(chosen)
+
+    lines = [
+        "# Implementation Statistics",
+        "",
+        (
+            "This document tracks the cumulative implementation time and total token cost for each "
+            "Orchestack delivery phase, aggregated across all coding agent implementation sessions "
+            "and PR/MR review or auto-heal turns."
+        ),
+        "",
+        "| Phase | Implementation Time | Total Token Cost |",
+        "| :--- | :---: | :---: |",
+    ]
+
+    total_duration = 0.0
+    total_tokens = 0
+    total_cost = 0.0
+
+    for row in phase_rows:
+        total_duration += row.duration_seconds
+        total_tokens += row.total_tokens
+        total_cost += row.estimated_cost_usd
+        dur_str = format_duration(row.duration_seconds)
+        cost_str = f"${row.estimated_cost_usd:.2f} ({row.total_tokens:,} tokens)"
+        lines.append(f"| `{row.phase_slug}` | {dur_str} | {cost_str} |")
+
+    tot_dur_str = format_duration(total_duration)
+    tot_cost_str = f"${total_cost:.2f} ({total_tokens:,} tokens)"
+    lines.append(f"| **Total** | **{tot_dur_str}** | **{tot_cost_str}** |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def update_implementation_stats(
+    repo_root: Path | None = None,
+    output_path: Path | None = None,
+    *,
+    report: (
+        TelemetryReport | Sequence[SessionTelemetry | Mapping[str, Any]] | Mapping[str, Any] | None
+    ) = None,
+    agy_cli_brain_dir: Path | None = None,
+    agy_ide_brain_dir: Path | None = None,
+    agy_summaries_dbs: Sequence[Path] | None = None,
+    claude_projects_dir: Path | None = None,
+    codex_sessions_dir: Path | None = None,
+    daemon_logs_dirs: Sequence[Path] | None = None,
+) -> Path:
+    """Collect multi-agent telemetry and write/update `docs/IMPLEMENTATION_STATS.md`."""
+    root = (repo_root or Path.cwd()).resolve()
+    target_path = (
+        output_path if output_path is not None else root / "docs" / "IMPLEMENTATION_STATS.md"
+    )
+
+    existing: dict[str, PhaseImplementationStats] = {}
+    default_stats_path = root / "docs" / "IMPLEMENTATION_STATS.md"
+    if default_stats_path.is_file():
+        existing.update(parse_existing_implementation_stats(default_stats_path))
+    if target_path.is_file() and target_path.resolve() != default_stats_path.resolve():
+        existing.update(parse_existing_implementation_stats(target_path))
+
+    slug_map = build_canonical_slug_map(root)
+
+    if report is None:
+        sessions, by_prompt = collect_multi_agent_telemetry(
+            repo_root=root,
+            agy_cli_brain_dir=agy_cli_brain_dir,
+            agy_ide_brain_dir=agy_ide_brain_dir,
+            agy_summaries_dbs=agy_summaries_dbs,
+            claude_projects_dir=claude_projects_dir,
+            codex_sessions_dir=codex_sessions_dir,
+            daemon_logs_dirs=daemon_logs_dirs,
+        )
+        report = TelemetryReport(sessions=sessions, by_prompt=by_prompt, slug_map=slug_map)
+
+    markdown = render_implementation_stats_markdown(
+        report,
+        repo_root=root,
+        existing_stats=existing,
+        slug_map=slug_map,
+    )
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(markdown, encoding="utf-8")
+    return target_path
