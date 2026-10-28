@@ -128,6 +128,14 @@ def _flatten_toml_config(raw: Mapping[str, Any]) -> dict[str, Any]:
         merged["forge_project"] = merged.pop("project")
     if "agent" in merged and "agent_type" not in merged and isinstance(merged["agent"], str):
         merged["agent_type"] = merged.pop("agent")
+    if "backend" in merged and "agent_type" not in merged and isinstance(merged["backend"], str):
+        merged["agent_type"] = merged.pop("backend")
+    if (
+        "agent_backend" in merged
+        and "agent_type" not in merged
+        and isinstance(merged["agent_backend"], str)
+    ):
+        merged["agent_type"] = merged.pop("agent_backend")
 
     return merged
 
@@ -141,7 +149,7 @@ class RepoConfig:
     branch_prefix: str = "orchestack"
     check_cmd: str = "make check"
     forge_type: str = "auto"  # "auto" | "github" | "gitlab" | "local"
-    agent_type: str = "gemini"  # "gemini" | "claude" | "codex" | "shell"
+    agent_type: str = "gemini"  # "gemini" | "agy" | "claude" | "codex" | "shell"
     require_learnings: bool = True
     require_pr_description: bool = True
     auto_whitelist_collaborators: bool = True
@@ -149,6 +157,7 @@ class RepoConfig:
     forge_provider: str = ""
     forge_host: str = ""
     forge_project: str = ""
+    agent_backend: str = ""
 
     def __post_init__(self) -> None:
         self.repo_root = Path(self.repo_root).resolve()
@@ -156,6 +165,10 @@ class RepoConfig:
             self.forge_type = self.forge_provider
         elif not self.forge_provider:
             self.forge_provider = self.forge_type
+        if self.agent_backend and self.agent_type == "gemini":
+            self.agent_type = self.agent_backend
+        elif not self.agent_backend:
+            self.agent_backend = self.agent_type
 
     @property
     def queued_dir(self) -> Path:
@@ -209,6 +222,7 @@ def load_repo_config(
     forge_host: str | None = None,
     forge_project: str | None = None,
     agent_type: str | None = None,
+    agent_backend: str | None = None,
     require_learnings: bool | None = None,
     require_pr_description: bool | None = None,
     auto_whitelist_collaborators: bool | None = None,
@@ -290,11 +304,13 @@ def load_repo_config(
         or ""
     )
 
+    explicit_agent = agent_type if agent_type is not None else agent_backend
     final_agent_type = (
-        agent_type
-        if agent_type is not None
+        explicit_agent
+        if explicit_agent is not None
         else environ.get("ORCHESTACK_AGENT")
         or environ.get("ORCHESTACK_AGENT_TYPE")
+        or environ.get("ORCHESTACK_AGENT_BACKEND")
         or (str(toml_data["agent_type"]) if "agent_type" in toml_data else None)
         or "gemini"
     )
@@ -355,6 +371,7 @@ def load_repo_config(
         forge_host=final_forge_host,
         forge_project=final_forge_project,
         agent_type=final_agent_type,
+        agent_backend=final_agent_type,
         require_learnings=final_require_learnings,
         require_pr_description=final_require_pr_description,
         auto_whitelist_collaborators=final_auto_whitelist,

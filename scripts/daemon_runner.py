@@ -87,6 +87,10 @@ from orchestack.agents.antigravity import (  # noqa: E402
 from orchestack.agents.antigravity import (  # noqa: E402
     parse_iso_timestamp as _agy_parse_iso_timestamp,
 )
+from orchestack.agents.base import AgentBackend  # noqa: E402
+from orchestack.agents.claude_code import ClaudeCodeAgent  # noqa: E402
+from orchestack.agents.codex import CodexAgent  # noqa: E402
+from orchestack.agents.factory import create_agent_backend  # noqa: E402
 from orchestack.config import RepoConfig, load_repo_config  # noqa: E402
 from orchestack.forge.github import (  # noqa: E402
     CI_BILLING_OR_QUOTA_PATTERNS as _FORGE_CI_BILLING_OR_QUOTA_PATTERNS,
@@ -119,6 +123,8 @@ CHECK_CMD = "make check"
 REQUIRE_LEARNINGS = True
 REQUIRE_PR_DESCRIPTION = False
 ACTIVE_CONFIG: RepoConfig | None = None
+_LAST_BACKEND_RESPONSE: str | None = None
+_LAST_BACKEND_SESSION_ID: str | None = None
 DAEMON_TAG = "🤖 **[BlueTeamHarness Daemon]**"
 DEFAULT_MAX_AUTO_HEAL_ATTEMPTS = 3
 DEFAULT_MODEL = "gemini-3.8-flash-high"
@@ -456,10 +462,15 @@ def record_daemon_metrics(record: dict[str, Any]) -> None:
 
 def extract_latest_agent_summary(conv_id: str | None = None) -> str | None:
     """Extract the concluding planner response from the latest session transcript."""
-    return _agy_extract_latest_agent_summary(
+    summary = _agy_extract_latest_agent_summary(
         conv_id=conv_id,
         brain_dir=CLI_BRAIN_DIR,
     )
+    if summary:
+        return summary
+    if _LAST_BACKEND_RESPONSE:
+        return _LAST_BACKEND_RESPONSE
+    return None
 
 
 def prompt_user_permission_action(
@@ -1368,6 +1379,180 @@ def is_transient_session_error(full_output: str, returncode: int) -> tuple[bool,
     return _agy_is_transient_session_error(full_output, returncode)
 
 
+def _execute_backend_prompt_session(
+    backend: AgentBackend,
+    prompt_path: Path,
+    log_file: Path,
+    title: str,
+    kickoff_prompt: str,
+    continuation_prompt: str,
+    resume: bool = False,
+    custom_prompt: str | None = None,
+) -> bool:
+    """Execute a multi-turn prompt session using a generic `AgentBackend`."""
+    global _LAST_BACKEND_RESPONSE, _LAST_BACKEND_SESSION_ID
+
+    is_first_turn = not resume
+    retry_count = 0
+    max_retries = 5
+    turn_count = 1
+    max_turns = 10
+    session_id: str | None = backend.get_latest_session_id(REPO_ROOT) if resume else None
+
+    while True:
+        current_prompt = kickoff_prompt if is_first_turn else continuation_prompt
+        is_first_turn = False
+
+        result = backend.run_turn(
+            prompt=current_prompt,
+            repo_root=REPO_ROOT,
+            session_id=session_id,
+            cli_log_path=log_file,
+        )
+        if result.session_id:
+            session_id = result.session_id
+            _LAST_BACKEND_SESSION_ID = session_id
+        if result.last_response:
+            _LAST_BACKEND_RESPONSE = result.last_response
+
+        # 1. Check for turn-scoped permission denials (B2)
+        denials = backend.detect_permission_denials(
+            session_id=session_id,
+            cli_log_path=log_file,
+            cli_log_offset=result.cli_log_offset,
+            turn_start_time=result.turn_start_time,
+        )
+        if denials:
+            denial = denials[0]
+            logger.warning(
+                "Tool permission denied in %s backend (%s: %s).",
+                backend.name,
+                denial.tool_name,
+                denial.resource,
+            )
+            whitelisted = backend.whitelist_denial(denial, REPO_ROOT)
+            if whitelisted:
+                detail = denial.command_prefix or denial.resource
+                logger.info("Whitelisted %s (%s). Resuming session...", denial.tool_name, detail)
+                if custom_prompt:
+                    continuation_prompt = (
+                        f"Tool permission for '{detail}' has been granted. "
+                        f"Please proceed with addressing the reviewer feedback for "
+                        f"{prompt_path.name} per PROTOCOL.md."
+                    )
+                else:
+                    continuation_prompt = (
+                        f"Tool permission for '{detail}' has been granted. "
+                        "Please proceed with implementation per PROTOCOL.md."
+                    )
+                retry_count = 0
+                continue
+            logger.error("Could not whitelist permission denial for %s.", denial)
+            return False
+
+        # 2. Check for transient errors
+        err_text = (result.error_message or "") + "\n" + (result.last_response or "")
+        is_transient, reason = is_transient_session_error(err_text, result.exit_code)
+        if result.exit_code != 0 and is_transient:
+            if retry_count < max_retries:
+                retry_count += 1
+                backoff_seconds = min(10 * (2 ** (retry_count - 1)), 120)
+                logger.warning(
+                    "⚠️  Transient error in %s session for %s: %s (exit code %d). "
+                    "Auto-resuming in %ds (retry %d/%d)...",
+                    backend.name,
+                    prompt_path.name,
+                    reason,
+                    result.exit_code,
+                    backoff_seconds,
+                    retry_count,
+                    max_retries,
+                )
+                time.sleep(backoff_seconds)
+                if custom_prompt:
+                    continuation_prompt = (
+                        f"A transient error ({reason}) interrupted the previous turn. "
+                        f"Please continue addressing the reviewer feedback for "
+                        f"{prompt_path.name} per PROTOCOL.md."
+                    )
+                else:
+                    continuation_prompt = (
+                        f"A transient error ({reason}) interrupted the previous turn. "
+                        f"Please review the repository state and continue implementing "
+                        f"prompts/queued/{prompt_path.name} per PROTOCOL.md."
+                    )
+                continue
+            logger.error(
+                "Session for %s exceeded maximum transient error retries (%d). Halting.",
+                prompt_path.name,
+                max_retries,
+            )
+            return False
+
+        if not result.completed_normally or result.exit_code != 0:
+            logger.error(
+                "Session (%s) exited with failure code %d (%s). See %s.",
+                backend.name,
+                result.exit_code,
+                result.error_message,
+                log_file,
+            )
+            return False
+
+        # 3. Check Definition of Done
+        impl_path = IMPLEMENTED_DIR / prompt_path.name
+        if impl_path.exists():
+            learnings_dir = (
+                LEARNINGS_DIR
+                if LEARNINGS_DIR != _DEFAULT_LEARNINGS_DIR
+                else REPO_ROOT / "docs" / "learnings"
+            )
+            learnings_file = learnings_dir / f"{prompt_path.stem}-learnings.md"
+            if REQUIRE_LEARNINGS and not learnings_file.exists() and turn_count < max_turns:
+                turn_count += 1
+                continuation_prompt = (
+                    f"The prompt file was moved to prompts/implemented/{prompt_path.name}, but "
+                    f"docs/learnings/{learnings_file.name} is missing. "
+                    "Per PROTOCOL.md §5, author this learnings file and docs/PR_DESCRIPTION.md, "
+                    f"and ensure `{CHECK_CMD}` passes."
+                )
+                continue
+
+            dod_ok, dod_error = check_definition_of_done(prompt_path)
+            if dod_ok:
+                logger.info(
+                    "Session (%s) completed and Definition of Done verified for prompt %s.",
+                    backend.name,
+                    prompt_path.name,
+                )
+                return True
+
+            if turn_count < max_turns:
+                turn_count += 1
+                continuation_prompt = (
+                    f"Definition of Done verification failed for "
+                    f"prompts/implemented/{prompt_path.name}.\n\n"
+                    f"{dod_error}\n\n"
+                    f"Please diagnose and resolve this issue and ensure `{CHECK_CMD}` "
+                    "passes locally."
+                )
+                continue
+            return False
+
+        if turn_count < max_turns:
+            turn_count += 1
+            continuation_prompt = (
+                f"Please continue implementing prompts/queued/{prompt_path.name} per PROTOCOL.md. "
+                "The implementation is still in progress. Follow all steps until the Definition "
+                "of Done is fully satisfied "
+                f"(move prompt to prompts/implemented/{prompt_path.name}, "
+                f"author docs/learnings/{prompt_path.stem}-learnings.md, "
+                f"author docs/PR_DESCRIPTION.md, and verify that `{CHECK_CMD}` passes locally)."
+            )
+            continue
+        return False
+
+
 def execute_prompt_session(
     agy_bin: str,
     prompt_path: Path,
@@ -1375,8 +1560,9 @@ def execute_prompt_session(
     effort: str | None = None,
     resume: bool = False,
     custom_prompt: str | None = None,
+    agent_backend: AgentBackend | None = None,
 ) -> bool:
-    """Run an Antigravity session with sandbox isolation and an interactive approval loop."""
+    """Run an agent session with sandbox isolation and an interactive/automated approval loop."""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOGS_DIR / f"session-{prompt_path.stem}.log"
 
@@ -1405,6 +1591,40 @@ def execute_prompt_session(
         continuation_prompt = (
             f"Please resume implementation of prompts/queued/{prompt_path.name} per PROTOCOL.md. "
             "Inspect the current workspace and repository state and continue."
+        )
+
+    effective_backend = agent_backend
+    if effective_backend is None and ACTIVE_CONFIG is not None:
+        cfg_agent = (ACTIVE_CONFIG.agent_backend or ACTIVE_CONFIG.agent_type or "").lower()
+        if cfg_agent in {"claude", "claude-code", "claude_code", "codex", "openai-codex"}:
+            effective_backend = create_agent_backend(
+                ACTIVE_CONFIG,
+                model=model,
+                effort=effort,
+                agent_bin=agy_bin if Path(agy_bin).name in {"claude", "codex"} else None,
+                cli_log_path=log_file,
+                repo_root=REPO_ROOT,
+            )
+
+    if effective_backend is not None and isinstance(
+        effective_backend, (ClaudeCodeAgent, CodexAgent)
+    ):
+        if resume and log_file.exists():
+            with log_file.open("a", encoding="utf-8") as lf:
+                suffix = "Review Feedback" if custom_prompt else "Continued"
+                lf.write(f"\n=== Resumed Session ({suffix}): {title} ===\n")
+        else:
+            with log_file.open("w", encoding="utf-8") as lf:
+                lf.write(f"=== {title}: {prompt_path.name} ===\n")
+        return _execute_backend_prompt_session(
+            backend=effective_backend,
+            prompt_path=prompt_path,
+            log_file=log_file,
+            title=title,
+            kickoff_prompt=kickoff_prompt,
+            continuation_prompt=continuation_prompt,
+            resume=resume,
+            custom_prompt=custom_prompt,
         )
 
     # Session launch using --sandbox (never --dangerously-skip-permissions)
@@ -2259,6 +2479,7 @@ def address_pr_feedback(
     new_comments: list[dict[str, Any]],
     model: str | None = None,
     effort: str | None = None,
+    agent_backend: AgentBackend | None = None,
 ) -> bool:
     """Resume session to address reviewer feedback, commit fixes, and push to origin."""
     logger.info(
@@ -2292,6 +2513,7 @@ def address_pr_feedback(
         effort=effort,
         resume=True,
         custom_prompt=feedback_prompt,
+        agent_backend=agent_backend,
     )
     if not success:
         logger.error("Session failed while addressing feedback for PR #%s.", pr_number)
@@ -2459,6 +2681,7 @@ def address_ci_failure(
     run_info: dict[str, Any],
     model: str | None = None,
     effort: str | None = None,
+    agent_backend: AgentBackend | None = None,
 ) -> bool:
     """Resume agent session with CI failure logs, verify fix, commit, and push."""
     run_id = str(run_info.get("databaseId", ""))
@@ -2491,6 +2714,7 @@ def address_ci_failure(
         effort=effort,
         resume=True,
         custom_prompt=ci_prompt,
+        agent_backend=agent_backend,
     )
     if not success:
         logger.error("Session failed while attempting to resolve CI failure on PR #%s.", pr_number)
@@ -3204,7 +3428,7 @@ def main() -> None:
         "--agent",
         type=str,
         default=None,
-        choices=["gemini", "claude", "codex", "shell"],
+        choices=["agy", "gemini", "antigravity", "claude", "codex", "shell"],
         help="Agent runner type override (default: gemini)",
     )
     parser.add_argument(
