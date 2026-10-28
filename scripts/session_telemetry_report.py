@@ -1,14 +1,30 @@
 #!/usr/bin/env python3
+# Copyright 2026 The Orchestack Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
-session_telemetry_report.py — Historical Session Telemetry, Token & Cost Reporter
+session_telemetry_report.py — Historical Multi-Agent Session Telemetry, Token & Cost Reporter
 
 Extracts and aggregates steps, token usage estimates, costs, tool calls, and duration
-across all past Antigravity CLI and IDE sessions in the BlueTeamHarness repository.
+across Antigravity, Claude Code, and Codex sessions in an Orchestack repository.
 
 Usage:
     uv run python scripts/session_telemetry_report.py [options]
 
 Options:
+    --repo PATH         Target repository root path.
+    --format FORMAT     Output format: markdown or json.
+    --output PATH       Destination file path for the generated report.
     --sessions, -s      Show granular breakdown of each individual session run.
     --backfill          Backfill historical prompt metrics to logs/daemon_metrics.jsonl.
     --json              Output aggregated statistics as JSON.
@@ -28,6 +44,30 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from orchestack.telemetry.reporter import (  # noqa: E402
+    DEFAULT_CLAUDE_PROJECTS_DIR,
+    DEFAULT_CODEX_SESSIONS_DIR,
+    FOUNDATIONAL_SESSIONS,
+    INPUT_COST_PER_MILLION,
+    OUTPUT_COST_PER_MILLION,
+    SessionTelemetry,
+    collect_multi_agent_telemetry,
+    discover_claude_sessions,
+    discover_codex_sessions,
+    format_telemetry_json,
+    format_telemetry_markdown,
+    parse_claude_events_telemetry,
+    parse_codex_events_telemetry,
+    parse_daemon_log_file,
+)
+
+CLAUDE_PROJECTS_DIR = DEFAULT_CLAUDE_PROJECTS_DIR
+CODEX_SESSIONS_DIR = DEFAULT_CODEX_SESSIONS_DIR
+
 LOGS_DIR = REPO_ROOT / "logs"
 DAEMON_METRICS_FILE = LOGS_DIR / "daemon_metrics.jsonl"
 IMPLEMENTED_DIR = REPO_ROOT / "prompts" / "implemented"
@@ -38,19 +78,41 @@ CLI_BRAIN_DIR = Path.home() / ".gemini" / "antigravity-cli" / "brain"
 IDE_SUMMARIES_DB = Path.home() / ".gemini" / "antigravity" / "conversation_summaries.db"
 CLI_SUMMARIES_DB = Path.home() / ".gemini" / "antigravity-cli" / "conversation_summaries.db"
 
-# Default pricing model: Gemini 2.5 Pro / standard agent ($1.25 / 1M input, $5.00 / 1M output)
-INPUT_COST_PER_MILLION = 1.25
-OUTPUT_COST_PER_MILLION = 5.00
-
-# Known UUID mapping for foundational pair-programming sessions (0001-0006)
-FOUNDATIONAL_SESSIONS = {
-    "99c957ab-37b8-408c-9983-01a771c34c8f": "0001",
-    "4dbfff7c-1f1f-4f27-9c28-c15b8f88fd3d": "0002",
-    "ca2a37ff-6bc0-42b2-8727-5d6f2a8476ff": "0003",
-    "c38d200c-d369-4aa1-875c-08b23b750ed3": "0004",
-    "3487dfb2-2e6e-4302-aefa-68d618429292": "0005",
-    "65e9c037-daad-4db6-a82b-5ed0157db297": "0006",
-}
+__all__ = [
+    "CLAUDE_PROJECTS_DIR",
+    "CLI_BRAIN_DIR",
+    "CLI_SUMMARIES_DB",
+    "CODEX_SESSIONS_DIR",
+    "DAEMON_METRICS_FILE",
+    "FOUNDATIONAL_SESSIONS",
+    "IDE_BRAIN_DIR",
+    "IDE_SUMMARIES_DB",
+    "IMPLEMENTED_DIR",
+    "INPUT_COST_PER_MILLION",
+    "LOGS_DIR",
+    "OUTPUT_COST_PER_MILLION",
+    "QUEUED_DIR",
+    "REPO_ROOT",
+    "SessionTelemetry",
+    "backfill_daemon_metrics_file",
+    "build_canonical_slug_map",
+    "collect_multi_agent_telemetry",
+    "collect_telemetry_dataset",
+    "discover_all_sessions",
+    "discover_claude_sessions",
+    "discover_codex_sessions",
+    "export_markdown_table",
+    "format_telemetry_json",
+    "format_telemetry_markdown",
+    "load_conversation_titles",
+    "main",
+    "parse_claude_events_telemetry",
+    "parse_codex_events_telemetry",
+    "parse_daemon_log_file",
+    "parse_session_transcript",
+    "print_individual_sessions",
+    "print_prompt_summary_table",
+]
 
 
 def build_canonical_slug_map() -> dict[str, str]:
@@ -191,7 +253,11 @@ def parse_session_transcript(
 
     # 2. Explicit daemon prompt kickoff in user messages
     if not prompt_num:
-        m_p = re.search(r"BlueTeamHarness\s*-\s*Prompt\s+(\d{4})", combined_user)
+        m_p = re.search(
+            r"(?:BlueTeamHarness|Orchestack)\s*-\s*Prompt\s+(\d{4})",
+            combined_user,
+            re.IGNORECASE,
+        )
         if m_p:
             prompt_num = m_p.group(1)
 
@@ -203,7 +269,10 @@ def parse_session_transcript(
 
     # 4. Explicit branch in user messages or thinking
     if not prompt_num:
-        m_b = re.search(r"branch\s+['\"]?gemini/(\d{4})-", combined_user + " " + combined_sample)
+        m_b = re.search(
+            r"branch\s+['\"]?(?:gemini|orchestack)/(\d{4})-",
+            combined_user + " " + combined_sample,
+        )
         if m_b:
             prompt_num = m_b.group(1)
 
@@ -239,6 +308,7 @@ def parse_session_transcript(
     slug = slug_map.get(prompt_num or "", f"other-{conv_id[:8]}")
 
     return {
+        "agent": "antigravity",
         "conv_id": conv_id,
         "prompt_num": prompt_num,
         "prompt_slug": slug,
@@ -268,6 +338,12 @@ def collect_telemetry_dataset() -> tuple[list[dict[str, Any]], dict[str, list[di
         if parsed:
             all_parsed.append(parsed)
 
+    # Also include Claude Code and Codex sessions
+    for claude_sess in discover_claude_sessions(CLAUDE_PROJECTS_DIR, slug_map=slug_map):
+        all_parsed.append(claude_sess.to_dict())
+    for codex_sess in discover_codex_sessions(CODEX_SESSIONS_DIR, slug_map=slug_map):
+        all_parsed.append(codex_sess.to_dict())
+
     all_parsed.sort(key=lambda s: s["mtime"])
 
     by_prompt: dict[str, list[dict[str, Any]]] = {}
@@ -287,7 +363,7 @@ def print_prompt_summary_table(
 ) -> None:
     """Print an ASCII telemetry summary table grouped by prompt."""
     print("\n" + "=" * 105)
-    print("📊 BlueTeamHarness — Autonomous Daemon & Prompt Telemetry Summary")
+    print("📊 Orchestack — Autonomous Daemon & Prompt Telemetry Summary")
     print("=" * 105)
     print(
         f"{'Prompt':<11} | {'Slug / Description':<38} | {'Sess':<4} | "
@@ -507,9 +583,27 @@ def backfill_daemon_metrics_file(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Extract and aggregate historical Antigravity session telemetry, steps, "
+            "Extract and aggregate historical multi-agent session telemetry, steps, "
             "tokens, and cost."
         )
+    )
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        default=None,
+        help="Target repository root path.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["markdown", "json"],
+        default=None,
+        help="Output format (markdown or json).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional output file path.",
     )
     parser.add_argument(
         "--sessions",
@@ -538,6 +632,22 @@ def main() -> None:
         help="Print summary in CSV format.",
     )
     args = parser.parse_args()
+
+    if args.format is not None or args.repo is not None or args.output is not None:
+        repo_path = (args.repo or REPO_ROOT).resolve()
+        slug_map = build_canonical_slug_map()
+        sessions, by_prompt_objs = collect_multi_agent_telemetry(repo_root=repo_path)
+        fmt = args.format or ("json" if args.json else "markdown")
+        if fmt == "json":
+            rendered = format_telemetry_json(sessions, by_prompt_objs, slug_map)
+        else:
+            rendered = format_telemetry_markdown(sessions, by_prompt_objs, slug_map)
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered + "\n", encoding="utf-8")
+        else:
+            print(rendered)
+        return
 
     slug_map = build_canonical_slug_map()
     all_sessions, by_prompt = collect_telemetry_dataset()

@@ -3451,6 +3451,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--poll-interval",
+        "--interval",
+        dest="poll_interval",
         type=int,
         default=30,
         help="Initial seconds between polling for merged PRs (default: 30s)",
