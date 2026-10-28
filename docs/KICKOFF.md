@@ -17,7 +17,7 @@ Before finishing, move the prompt to prompts/implemented/, write its learnings f
 
 ## Option B: Autonomous Daemon Self-Hosting (Dogfooding!)
 
-Because Orchestack is seeded with the working `scripts/run_daemon.sh` and `scripts/daemon_runner.py`, once your git remote (`origin`) is configured on GitHub (or GitLab after Prompt `0003`), Orchestack can autonomously process its own prompt queue (`prompts/queued/0001-*.md` through `0006-*.md`):
+Because Orchestack is seeded with the working `scripts/run_daemon.sh` and `scripts/daemon_runner.py`, once your git remote (`origin`) is configured on GitHub (or GitLab after Prompt `0003`), Orchestack can autonomously process its own prompt queue (`prompts/queued/0001-*.md` through `0008-*.md`):
 
 ```bash
 ./scripts/run_daemon.sh

@@ -30,6 +30,8 @@ Options:
     --json              Output aggregated statistics as JSON.
     --markdown          Output aggregated statistics as a GitHub Markdown table.
     --csv               Export summary as CSV.
+    --update-stats      Write/update per-phase implementation stats in docs/IMPLEMENTATION_STATS.md.
+    --stats-file PATH   Custom destination path for the implementation stats Markdown document.
 """
 
 from __future__ import annotations

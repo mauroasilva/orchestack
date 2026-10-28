@@ -37,7 +37,7 @@ Read in this order, and **stop reading as soon as you have what you need**:
 2. `docs/PLAN.md` — the architecture, never re-derived. Navigate it:
    - `grep -n "^#\{1,3\} " docs/PLAN.md` prints the section index. Start there.
    - Read the sections and decisions your prompt's `## Read first` names.
-   - §2's **register** states every architectural decision (`D1`–`D12`).
+   - §2's **register** states every architectural decision (`D1`–`D13`).
 3. `docs/learnings/*` — read **only the Summary block** of each file first.
 4. Your target prompt in `prompts/queued/`.
 
@@ -59,7 +59,7 @@ Read in this order, and **stop reading as soon as you have what you need**:
   work that belongs to a later phase, note it in your learnings file or add a
   queued prompt (§6).
 - **Follow the plan.** Match `docs/PLAN.md`: package layout (`src/orchestack/`),
-  interfaces (`RepoConfig`, `ForgeProvider`, `AgentBackend`), and decisions (`D1`–`D12`).
+  interfaces (`RepoConfig`, `ForgeProvider`, `AgentBackend`), and decisions (`D1`–`D13`).
 - **Keep the plan's indexes fresh.** If you change a decision or phase, update
   `docs/PLAN.md` §2 or §13 in the same PR (`tests/docs/test_indexes.py` enforces this).
 - **Add the SPDX header** (`docs/LICENSE-HEADER.md`) to every new source and test file.
@@ -70,7 +70,7 @@ Read in this order, and **stop reading as soon as you have what you need**:
 Orchestack was seeded from the production-hardened `scripts/daemon_runner.py`
 (4,290 lines) and `scripts/tests/test_daemon_runner.py` (82 unit tests). As you
 modularize `scripts/daemon_runner.py` into `src/orchestack/` across Phases
-`0001`–`0006`, **you MUST preserve 100% of the following battle-tested fixes and
+`0001`–`0008`, **you MUST preserve 100% of the following battle-tested fixes and
 keep all 82 baseline unit tests passing**:
 
 1. **Stale Transcript & Session Status Filtering**:

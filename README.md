@@ -9,7 +9,8 @@ Point `orchestack` at any Git repository hosted on **GitHub** (`gh`) or **GitLab
 3. **Open Rich Pull / Merge Requests**: Push the branch, verify git staging safety (preventing accidental `.gitignore` omissions in protected directories), and open a comprehensive PR (GitHub) or MR (GitLab).
 4. **Auto-Heal CI Failures (with Quota/Billing Fallback)**: Monitor GitHub Actions or GitLab CI pipelines, automatically feed failed job logs back into the agent session (`-c` / `resume --last`) to fix broken builds, or fall back to local test verification if cloud CI minutes/quotas are exhausted.
 5. **Address Reviewer Feedback & Inline Diff Threads**: Poll PR/MR review comments, review summaries, and inline diff discussions, resume the agent session to implement fixes or answer technical questions, push commits, and post a structured response back to the PR/MR thread—guarded by configurable circuit breakers.
-6. **Cross-Agent Telemetry & Cost Reporting**: Track steps, tool calls, token usage, and estimated USD cost across Antigravity (`agy`), Claude Code (`claude`), and Codex (`codex`).
+6. **Cross-Agent Telemetry & Cost Reporting**: Track steps, tool calls, token usage, and estimated USD cost across Antigravity (`agy`), Claude Code (`claude`), and Codex (`codex`), plus per-phase implementation time and cost in [`docs/IMPLEMENTATION_STATS.md`](docs/IMPLEMENTATION_STATS.md).
+7. **Three-State Repository Bootstrap & PR Interview (`Phase 0000`)**: Support queue-ready, `docs/BRIEF.md`-only, and empty repositories via a `Phase 0000` bootstrap PR and iterative numbered-question PR-comment user interviews.
 
 ---
 
@@ -29,6 +30,7 @@ make check
 ## Documentation & Architecture
 
 - [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — Session protocol and **Non-Negotiable Regression Invariants**.
-- [`docs/PLAN.md`](docs/PLAN.md) — Architecture source of truth, decision register (`D1`–`D12`), and phased delivery roadmap (`0001`–`0006`).
+- [`docs/PLAN.md`](docs/PLAN.md) — Architecture source of truth, decision register (`D1`–`D13`), and phased delivery roadmap (`0001`–`0008`).
+- [`docs/IMPLEMENTATION_STATS.md`](docs/IMPLEMENTATION_STATS.md) — Per-phase implementation time and total token cost across coding agent sessions and review turns.
 - [`docs/KICKOFF.md`](docs/KICKOFF.md) — Kickoff prompts for interactive sessions or autonomous daemon execution.
 - [`docs/learnings/`](docs/learnings/) — Durable session hand-offs and historical bugfix context.

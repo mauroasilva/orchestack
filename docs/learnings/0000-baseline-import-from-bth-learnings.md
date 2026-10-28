@@ -3,8 +3,8 @@
 ## Summary
 - **What shipped**: Imported the production-hardened `scripts/daemon_runner.py` (4,290 lines), `scripts/tests/test_daemon_runner.py` (2,553 lines, 82 unit tests), `scripts/session_telemetry_report.py` (596 lines), and `scripts/run_daemon.sh` as the Day-0 baseline of Orchestack.
 - **Key packages/files**: `scripts/daemon_runner.py`, `scripts/tests/test_daemon_runner.py`, `scripts/session_telemetry_report.py`, `docs/PROTOCOL.md`, `docs/PLAN.md`.
-- **Key interfaces/types added or changed**: Baseline functions in `scripts/daemon_runner.py` remain intact as a backward-compatible facade while modularization into `src/orchestack/` proceeds across Phases `0001`–`0006`.
-- **Decisions made/affected**: D1–D12 in `docs/PLAN.md`.
+- **Key interfaces/types added or changed**: Baseline functions in `scripts/daemon_runner.py` remain intact as a backward-compatible facade while modularization into `src/orchestack/` proceeds across Phases `0001`–`0008`.
+- **Decisions made/affected**: D1–D13 in `docs/PLAN.md`.
 - **Gotchas / non-obvious constraints**: All 82 unit tests in `scripts/tests/test_daemon_runner.py` test real production bugfixes (stale transcript timestamps, turn-scoped permission denials, `-impl` branch collision handling, CI billing/quota local test fallback, single-run DoD, `[bot]`/approved review filtering, git staging safety pre-checks). Never delete or weaken these tests; keep `scripts/daemon_runner.py` re-exporting symbols or delegating to `src/orchestack/` so all 82 baseline tests stay green at every phase.
 - **What the NEXT session must know**: Start with `prompts/queued/0001-core-package-and-repo-config.md`. Build `src/orchestack/config.py` (`RepoConfig`) and wire `scripts/daemon_runner.py` to use it while keeping module-level defaults backward-compatible for existing tests.
 
