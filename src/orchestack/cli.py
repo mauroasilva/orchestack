@@ -18,6 +18,7 @@ import typer
 
 from orchestack import __version__
 from orchestack.agents.factory import create_agent_backend, normalize_agent_backend_name
+from orchestack.bootstrap import detect_repo_bootstrap_state
 from orchestack.config import (
     RepoConfig,
     configure_runtime,
@@ -312,8 +313,11 @@ def collect_repo_status(repo_root: Path | None = None) -> dict[str, Any]:
         except Exception:
             pass
 
+    bootstrap_state = detect_repo_bootstrap_state(config.repo_root).value
+
     return {
         "repo_root": str(config.repo_root),
+        "bootstrap_state": bootstrap_state,
         "base_branch": config.base_branch,
         "branch_prefix": config.branch_prefix,
         "check_cmd": config.check_cmd,
@@ -811,6 +815,7 @@ def status_cmd_entry(
 
     lock_str = "LOCKED" if status_data["daemon_locked"] else "unlocked"
     typer.echo(f"Orchestack Status — {status_data['repo_root']}")
+    typer.echo(f"  Bootstrap state : {status_data['bootstrap_state']}")
     typer.echo(f"  Base branch     : {status_data['base_branch']}")
     typer.echo(f"  Forge provider  : {status_data['forge']}")
     typer.echo(f"  Agent backend   : {status_data['agent']}")

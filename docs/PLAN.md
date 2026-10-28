@@ -46,7 +46,7 @@ Orchestack evolved from the battle-tested `scripts/daemon_runner.py` (4,290 line
 - **D10 — Configurable Definition of Done (`DoD`)**: Different repositories use different test commands (`make check`, `pytest`, `npm test`, `cargo test`) and documentation conventions. `RepoConfig` makes `check_cmd`, `require_learnings`, `require_pr_description`, and `branch_prefix` configurable per repo.
 - **D11 — Backward-Compatible `scripts/daemon_runner.py` Facade**: To ensure the 82 unit tests in `scripts/tests/test_daemon_runner.py` (which monkeypatch attributes on `daemon_runner`) continue working without weakening any assertions, `scripts/daemon_runner.py` remains as a thin facade delegating to `orchestack` modules.
 - **D12 — Unified Multi-Agent Telemetry**: `orchestack telemetry` extends `scripts/session_telemetry_report.py` to parse Antigravity `~/.gemini/antigravity/conversations/*.pb` / `state.vscdb`, Claude Code `~/.claude/projects/**/*.jsonl`, and Codex `~/.codex/sessions/**/*.jsonl` into a unified `SessionTelemetry` report.
-- **D13 — Three-State Repository Bootstrap & Phase 0000 PR-Comment Interview**: Target repositories fall into one of three states: (1) `QUEUE_READY` (has an existing queue of prompts), (2) `BRIEF_ONLY` (contains only `docs/BRIEF.md`), or (3) `EMPTY_REPO` (no brief and no prompt queue). In states 2 and 3, Orchestack launches a `Phase 0000` bootstrap session that scaffolds a skeleton repository (`docs/KICKOFF.md`, `docs/PLAN.md`, `docs/PROTOCOL.md`, etc.), opens an initial PR whose description summarizes what the session understood it is trying to build, and interviews the user through numbered lists of questions in PR comments (assuming nothing) until it has enough clarity to finalize `docs/BRIEF.md` (in state 3), `docs/PLAN.md`, and the full queue of `prompts/queued/NNNN-*.md` prompts.
+- **D13 — Three-State Repository Bootstrap & Phase 0000 PR-Comment Interview**: Target repositories fall into one of three states (`src/orchestack/bootstrap.py`): (1) `QUEUE_READY` (has an existing queue of prompts or completed phases), (2) `BRIEF_ONLY` (contains `docs/BRIEF.md` and no `0001+` prompts), or (3) `EMPTY_REPO` (no brief and no prompt queue). In states 2 and 3, Orchestack automatically generates `prompts/queued/0000-bootstrap-plan-and-prompts.md` (initializing `<base_branch>` with an initial commit if `HEAD` does not exist yet), opens an initial PR whose description (`docs/PR_DESCRIPTION.md`) summarizes what the session understood it is trying to build, and interviews the user through numbered lists of questions in PR comments (`.daemon/phase0000_questions.md`, assuming nothing and exempt from the review-feedback circuit breaker) until it has enough clarity to finalize `docs/BRIEF.md` (in state 3), `docs/PLAN.md`, `docs/PROTOCOL.md`, `docs/LICENSE-HEADER.md`, `README.md`, and the full queue of `prompts/queued/0001-*.md`..`000N-*.md` prompts.
 
 ---
 
@@ -159,14 +159,14 @@ When an agent is blocked from running a shell command or reading a URL/file:
 
 ## 8. Daemon Loop & State Machine
 
-Located in `src/orchestack/daemon/`:
-- Each cycle classifies the target repository into `QUEUE_READY`, `BRIEF_ONLY`, or `EMPTY_REPO` (`D13`) and executes priority tiers:
+Located in `src/orchestack/bootstrap.py` and `scripts/daemon_runner.py`:
+- Each cycle classifies the target repository into `QUEUE_READY`, `BRIEF_ONLY`, or `EMPTY_REPO` (`D13`) via `detect_repo_bootstrap_state()` and executes priority tiers:
   1. **Tier 1 — Open PR/MR Review & CI Loop (plus Phase 0000 Interview Loop)**:
      - Lists open PRs/MRs matching `repo_config.branch_prefix`.
-     - If an open PR/MR is on the Phase 0000 bootstrap branch (`<prefix>/0000-bootstrap-plan`):
-       - Polls `ForgeProvider.get_unprocessed_reviews()` for user replies to the numbered interview questions.
-       - When new user answers arrive, resumes the Phase 0000 session to either post the next numbered question comment (`<!-- orchestack-interview-status: awaiting-answers -->`) or, once all ambiguities are resolved, finalize `docs/BRIEF.md` (when starting from `EMPTY_REPO`), `docs/PLAN.md`, and `prompts/queued/NNNN-*.md` (`<!-- orchestack-interview-status: ready -->`).
-       - Never auto-merges a Phase 0000 PR while awaiting user answers; merges only after the interview is complete, queued prompts exist, and CI/DoD pass.
+     - If an open PR/MR is on the Phase 0000 bootstrap branch (`<prefix>/0000-bootstrap-plan-and-prompts`):
+       - Polls `fetch_unhandled_pr_feedback()` for user replies to the numbered interview questions, exempting active Phase 0000 interviews from `max_auto_heal_attempts` circuit breakers.
+       - When new user answers arrive, builds a Phase 0000 interview prompt (`build_phase_0000_interview_prompt()`) and resumes the Phase 0000 session to update the PR description (`docs/PR_DESCRIPTION.md`) and either post the next numbered question comment (`format_phase_0000_questions_comment()`) or, once all ambiguities are resolved, finalize `docs/BRIEF.md` (when starting from `EMPTY_REPO`), `docs/PLAN.md`, `docs/PROTOCOL.md`, `docs/LICENSE-HEADER.md`, `README.md`, and `prompts/queued/0001-*.md`..`000N-*.md`, move `0000-bootstrap-plan-and-prompts.md` to `prompts/implemented/`, and post a completion comment (`format_phase_0000_completion_comment()`).
+       - Never marks a Phase 0000 PR ready-for-merge while awaiting user answers; marks ready only after `is_phase_0000_complete()` is satisfied (`prompts/implemented/0000-bootstrap-plan-and-prompts.md`, `docs/PLAN.md`, and at least one `0001+` queued prompt exist).
      - For standard implementation PRs/MRs:
        - Checks CI status via `ForgeProvider.get_ci_status()`. If CI failed due to quota (`QUOTA_EXCEEDED`), runs `verify_local_tests_for_pr()`.
        - Fetches unprocessed human reviews and inline comments via `ForgeProvider.get_unprocessed_reviews()`.
@@ -174,7 +174,7 @@ Located in `src/orchestack/daemon/`:
        - If CI passed (or local fallback passed) and no unresolved reviews remain, merges the PR/MR via `ForgeProvider.merge_pr()`.
   2. **Tier 2 — Next Queued Prompt Execution (or Initial Phase 0000 Kickoff)**:
      - If the repository is in `BRIEF_ONLY` or `EMPTY_REPO` state and no open Phase 0000 PR exists:
-       - Creates branch `<prefix>/0000-bootstrap-plan`, launches the initial Phase 0000 session to scaffold the skeleton repo (`docs/KICKOFF.md`, `docs/PROTOCOL.md`, `docs/PLAN.md`, `docs/LICENSE-HEADER.md`, `prompts/queued/`, `prompts/implemented/`, `docs/learnings/`, and `docs/BRIEF.md` if `EMPTY_REPO`), opens the Phase 0000 PR with a description summarizing what the session understood it is trying to build, and posts the first PR comment with a numbered list of clarifying questions.
+       - Ensures `<base_branch>` has an initial commit (`ensure_base_branch_initialized()`), scaffolds `prompts/queued/0000-bootstrap-plan-and-prompts.md` and `.daemon/bootstrap_state.json` (`scaffold_phase_0000_prompt()`), creates branch `<prefix>/0000-bootstrap-plan-and-prompts`, launches the initial Phase 0000 session to author `docs/PR_DESCRIPTION.md` (summary of understanding) and `.daemon/phase0000_questions.md`, opens the Phase 0000 PR with that summary description, and posts the first PR comment with a numbered list of clarifying questions.
      - If the repository is in `QUEUE_READY` state:
        - Scans `repo_config.queued_dir` for the lowest-numbered `NNNN-*.md` prompt.
        - Checks `is_prompt_merged_into_origin_main()` (`B3`). Creates branch `<prefix>/<NNNN>-<slug>` (or `-impl` if an earlier branch was merged without moving the prompt file).
@@ -198,7 +198,7 @@ Located in `src/orchestack/telemetry/`:
 Located in `src/orchestack/cli.py`:
 - `orchestack run [--repo PATH] [--forge auto|github|gitlab] [--agent agy|claude|codex] [--once] [--interval SEC] [--auto-whitelist]`
 - `orchestack init [--repo PATH] [--forge ...] [--agent ...]` — Scaffolds `.orchestack.toml`, `prompts/queued/`, `prompts/implemented/`, `docs/learnings/`, and `.gitignore` entries in any target git repository.
-- `orchestack status [--repo PATH]` — Displays queued/implemented prompt counts, open PR/MR status, lock status, and recent session state.
+- `orchestack status [--repo PATH] [--json]` — Displays detected repository bootstrap state (`queue_ready`, `brief_only`, `empty_repo`), queued/implemented prompt counts, open PR/MR status, lock status, and recent session state.
 - `orchestack doctor [--repo PATH]` — Verifies git remote, forge CLI auth (`gh auth status` / `glab auth status`), agent CLI binary availability (`agy`, `claude`, `codex`), and `.orchestack.toml` validity.
 - `orchestack telemetry [--repo PATH] [--format markdown|json] [--update-stats] [--stats-file PATH]` — Generates multi-agent session telemetry reports and updates `docs/IMPLEMENTATION_STATS.md`.
 - Legacy flags passed directly (`orchestack --once` or `python3 scripts/daemon_runner.py --once`) remain 100% supported (`D11`).
@@ -231,4 +231,4 @@ Located in `src/orchestack/cli.py`:
 | 0005 | `claude-code-and-codex-agent-backends` | Implement `ClaudeCodeAgent` (`claude`) and `CodexAgent` (`codex`) with session resume, JSONL heartbeat/summary parsing, and backend-specific permission auto-whitelisting. | Implemented |
 | 0006 | `cli-subcommands-and-multi-agent-telemetry` | Implement `orchestack` subcommands (`run`, `init`, `status`, `doctor`, `telemetry`), update `scripts/run_daemon.sh`, and add cross-agent telemetry reporting. | Implemented |
 | 0007 | `phase-implementation-stats-tracking` | Record per-phase implementation time and total token cost in `docs/IMPLEMENTATION_STATS.md` via telemetry reporting and daemon phase completion hooks. | Implemented |
-| 0008 | `phase-0000-bootstrap-and-pr-interview` | Support 3 target repository states (`QUEUE_READY`, `BRIEF_ONLY`, `EMPTY_REPO`) with a Phase 0000 bootstrap PR and iterative numbered-question PR-comment user interviews to build `docs/BRIEF.md`, `docs/PLAN.md`, and `prompts/queued/NNNN-*.md`. | Queued |
+| 0008 | `phase-0000-bootstrap-and-pr-interview` | Support 3 target repository states (`QUEUE_READY`, `BRIEF_ONLY`, `EMPTY_REPO`) with a Phase 0000 bootstrap PR and iterative numbered-question PR-comment user interviews to build `docs/BRIEF.md`, `docs/PLAN.md`, and `prompts/queued/NNNN-*.md`. | Implemented |

@@ -91,6 +91,20 @@ from orchestack.agents.base import AgentBackend  # noqa: E402
 from orchestack.agents.claude_code import ClaudeCodeAgent  # noqa: E402
 from orchestack.agents.codex import CodexAgent  # noqa: E402
 from orchestack.agents.factory import create_agent_backend  # noqa: E402
+from orchestack.bootstrap import (  # noqa: E402
+    PHASE_0000_FILENAME,
+    RepoBootstrapState,
+    build_phase_0000_interview_prompt,
+    detect_repo_bootstrap_state,
+    ensure_base_branch_initialized,
+    extract_phase_0000_questions,
+    format_phase_0000_completion_comment,
+    format_phase_0000_questions_comment,
+    is_phase_0000_complete,
+    is_phase_0000_interview_pending,
+    is_phase_0000_prompt,
+    scaffold_phase_0000_prompt,
+)
 from orchestack.config import RepoConfig, load_repo_config  # noqa: E402
 from orchestack.forge.github import (  # noqa: E402
     CI_BILLING_OR_QUOTA_PATTERNS as _FORGE_CI_BILLING_OR_QUOTA_PATTERNS,
@@ -114,11 +128,13 @@ LEARNINGS_DIR = REPO_ROOT / "docs" / "learnings"
 _DEFAULT_LEARNINGS_DIR = LEARNINGS_DIR
 PR_DESC_PATH = REPO_ROOT / "docs" / "PR_DESCRIPTION.md"
 _DEFAULT_PR_DESC_PATH = PR_DESC_PATH
+BRIEF_PATH = REPO_ROOT / "docs" / "BRIEF.md"
 IMPLEMENTATION_STATS_PATH = REPO_ROOT / "docs" / "IMPLEMENTATION_STATS.md"
 _DEFAULT_IMPLEMENTATION_STATS_PATH = IMPLEMENTATION_STATS_PATH
 DAEMON_DIR = REPO_ROOT / ".daemon"
 LOCK_FILE = DAEMON_DIR / "daemon.lock"
 REVIEW_STATE_FILE = DAEMON_DIR / "review_state.json"
+PHASE_0000_QUESTIONS_FILE = DAEMON_DIR / "phase0000_questions.md"
 LOGS_DIR = REPO_ROOT / "logs"
 PR_REVIEWS_FILE = LOGS_DIR / "pr_reviews.json"
 DAEMON_METRICS_FILE = LOGS_DIR / "daemon_metrics.jsonl"
@@ -222,6 +238,7 @@ logger = logging.getLogger("bth-daemon")
 def configure_runtime(config: RepoConfig) -> RepoConfig:
     """Rebind module-level repository paths and settings from a `RepoConfig`."""
     global REPO_ROOT, QUEUED_DIR, IMPLEMENTED_DIR, LEARNINGS_DIR, PR_DESC_PATH
+    global BRIEF_PATH, PHASE_0000_QUESTIONS_FILE
     global IMPLEMENTATION_STATS_PATH
     global DAEMON_DIR, LOCK_FILE, REVIEW_STATE_FILE, LOGS_DIR, PR_REVIEWS_FILE
     global DAEMON_METRICS_FILE, BASE_BRANCH, BRANCH_PREFIX, CHECK_CMD
@@ -232,10 +249,12 @@ def configure_runtime(config: RepoConfig) -> RepoConfig:
     IMPLEMENTED_DIR = config.implemented_dir
     LEARNINGS_DIR = config.learnings_dir
     PR_DESC_PATH = config.pr_description_path
+    BRIEF_PATH = config.brief_path
     IMPLEMENTATION_STATS_PATH = config.implementation_stats_path
     DAEMON_DIR = config.daemon_dir
     LOCK_FILE = config.lock_file
     REVIEW_STATE_FILE = config.review_state_file
+    PHASE_0000_QUESTIONS_FILE = config.phase_0000_questions_file
     LOGS_DIR = config.logs_dir
     PR_REVIEWS_FILE = config.pr_reviews_file
     DAEMON_METRICS_FILE = config.daemon_metrics_file
@@ -786,22 +805,34 @@ def prompt_user_to_whitelist(perm_info: tuple[str, str | None]) -> bool:
     return action == "allow"
 
 
-def get_next_prompt() -> Path | None:
+def get_next_prompt(*, bootstrap_if_needed: bool = False) -> Path | None:
     """Find the lowest-numbered prompt in prompts/queued/."""
-    if not QUEUED_DIR.is_dir():
-        return None
-
     prompt_files: list[tuple[int, Path]] = []
-    for path in QUEUED_DIR.glob("*.md"):
-        match = re.match(r"^(\d{4})-", path.name)
-        if match:
-            prompt_files.append((int(match.group(1)), path))
+    if QUEUED_DIR.is_dir():
+        for path in QUEUED_DIR.glob("*.md"):
+            match = re.match(r"^(\d{4})-", path.name)
+            if match:
+                prompt_files.append((int(match.group(1)), path))
 
-    if not prompt_files:
-        return None
+    if prompt_files:
+        prompt_files.sort(key=lambda x: x[0])
+        return prompt_files[0][1]
 
-    prompt_files.sort(key=lambda x: x[0])
-    return prompt_files[0][1]
+    if bootstrap_if_needed:
+        state = detect_repo_bootstrap_state(REPO_ROOT)
+        if (
+            state in {RepoBootstrapState.BRIEF_ONLY, RepoBootstrapState.EMPTY_REPO}
+            and not (IMPLEMENTED_DIR / PHASE_0000_FILENAME).is_file()
+        ):
+            logger.info(
+                "Repository bootstrap state detected: %s. Scaffolding %s...",
+                state.value,
+                PHASE_0000_FILENAME,
+            )
+            ensure_base_branch_initialized(REPO_ROOT, BASE_BRANCH, run_cmd_fn=run_cmd)
+            return scaffold_phase_0000_prompt(REPO_ROOT, state)
+
+    return None
 
 
 def find_prompt_path_for_branch(
@@ -1596,6 +1627,17 @@ def _execute_backend_prompt_session(
                 continue
             return False
 
+        if is_phase_0000_prompt(prompt_path) and is_phase_0000_interview_pending(
+            REPO_ROOT, prompt_path, agent_summary=result.last_response or None
+        ):
+            logger.info(
+                "Phase 0000 interview questions ready for %s (%s). "
+                "Pausing session to post PR interview questions.",
+                prompt_path.name,
+                backend.name,
+            )
+            return True
+
         if turn_count < max_turns:
             turn_count += 1
             continuation_prompt = (
@@ -1991,6 +2033,16 @@ def execute_prompt_session(
                 return False
 
         # If prompt is still in queued/, the agent's turn ended before finishing the implementation!
+        if is_phase_0000_prompt(prompt_path) and is_phase_0000_interview_pending(
+            REPO_ROOT, prompt_path, agent_summary=extract_latest_agent_summary()
+        ):
+            logger.info(
+                "Phase 0000 interview questions ready for %s. "
+                "Pausing session to post PR interview questions.",
+                prompt_path.name,
+            )
+            return True
+
         if turn_count < max_turns:
             turn_count += 1
             logger.info(
@@ -2238,9 +2290,11 @@ def build_pr_description(
     if pr_desc_file.is_file():
         try:
             content = pr_desc_file.read_text(encoding="utf-8").strip()
-            if content and len(content) > 80:
+            if content and (len(content) > 80 or is_phase_0000_prompt(prompt_path)):
                 logger.info("Using agent-authored docs/PR_DESCRIPTION.md for PR description.")
-                if "### Definition of Done" not in content:
+                if "### Definition of Done" not in content and not is_phase_0000_prompt(
+                    prompt_path
+                ):
                     content += (
                         "\n\n---\n\n### Definition of Done\n"
                         "- [x] Prompt moved to `prompts/implemented/`\n"
@@ -2290,6 +2344,14 @@ def build_pr_description(
         f"- [x] `{CHECK_CMD}` passes locally\n"
         "- [ ] CI is green on the PR (checked automatically by daemon runner)\n"
     )
+
+
+def _resolve_phase_0000_questions() -> str | None:
+    """Resolve Phase 0000 clarifying questions from disk or latest agent response."""
+    questions = extract_phase_0000_questions(REPO_ROOT)
+    if questions:
+        return questions
+    return extract_phase_0000_questions(REPO_ROOT, extract_latest_agent_summary())
 
 
 def ensure_pr_opened(
@@ -2347,6 +2409,20 @@ def ensure_pr_opened(
                 branch_name,
                 existing_pr.get("url"),
             )
+            if is_phase_0000_prompt(prompt_path):
+                pr_num_open = existing_pr.get("number")
+                if pr_num_open:
+                    pr_body_open = build_pr_description(prompt_path, branch_name, base_branch=base)
+                    run_cmd(
+                        [gh_bin, "pr", "edit", str(pr_num_open), "--body", pr_body_open],
+                        check=False,
+                    )
+                    questions = _resolve_phase_0000_questions()
+                    if questions and not (IMPLEMENTED_DIR / prompt_path.name).is_file():
+                        q_comment = (
+                            f"{DAEMON_TAG}\n\n{format_phase_0000_questions_comment(questions)}"
+                        )
+                        _make_github_forge(gh_bin).post_pr_comment(int(pr_num_open), q_comment)
             return True
 
     logger.info("Pushing branch '%s' to origin...", branch_name)
@@ -2382,6 +2458,26 @@ def ensure_pr_opened(
             sound="Glass",
             subtitle=branch_name,
         )
+        if is_phase_0000_prompt(prompt_path) and not (IMPLEMENTED_DIR / prompt_path.name).is_file():
+            questions = _resolve_phase_0000_questions()
+            if questions:
+                pr_num_match = re.search(
+                    r"/pull/(\d+)|/merge_requests/(\d+)|(?:^|\s)#?(\d+)\s*$",
+                    (create_res.stdout or "").strip(),
+                )
+                pr_num_created: int | None = None
+                if pr_num_match:
+                    matched_digits = next((g for g in pr_num_match.groups() if g), None)
+                    if matched_digits:
+                        pr_num_created = int(matched_digits)
+                if pr_num_created is None:
+                    status_info = get_branch_pr_status(gh_bin, branch_name)
+                    if status_info and status_info.get("number"):
+                        pr_num_created = int(status_info["number"])
+                    else:
+                        pr_num_created = 1
+                q_comment = f"{DAEMON_TAG}\n\n{format_phase_0000_questions_comment(questions)}"
+                _make_github_forge(gh_bin).post_pr_comment(pr_num_created, q_comment)
         return True
     err_out = (create_res.stderr or "") + ("\n" + create_res.stdout if create_res.stdout else "")
     if "No commits between" in err_out:
@@ -2484,12 +2580,11 @@ def build_review_feedback_prompt(
     pr_number: int | str,
     pr_title: str,
     comments: list[dict[str, Any]],
+    *,
+    prompt_path: Path | None = None,
 ) -> str:
     """Format review comments and feedback into a clear, actionable session prompt."""
-    sections: list[str] = [
-        f"Reviewer feedback has been submitted on Pull Request #{pr_number} ('{pr_title}').",
-        "\n### Review Comments to Address:\n",
-    ]
+    comment_sections: list[str] = []
 
     for idx, c in enumerate(comments, 1):
         author = c.get("author") or "Reviewer"
@@ -2500,29 +2595,43 @@ def build_review_feedback_prompt(
 
         if path:
             loc = f"`{path}:{line}`" if line else f"`{path}`"
-            sections.append(f"#### {idx}. Review comment from @{author} on {loc}:")
+            comment_sections.append(f"#### {idx}. Review comment from @{author} on {loc}:")
             if diff_hunk:
                 diff_clean = diff_hunk.strip()
-                sections.append(f"```diff\n{diff_clean}\n```")
-            sections.append(f"> {body}\n")
+                comment_sections.append(f"```diff\n{diff_clean}\n```")
+            comment_sections.append(f"> {body}\n")
         elif c.get("type") == "review_summary":
-            sections.append(f"#### {idx}. Review summary from @{author}:")
-            sections.append(f"> {body}\n")
+            comment_sections.append(f"#### {idx}. Review summary from @{author}:")
+            comment_sections.append(f"> {body}\n")
         else:
-            sections.append(f"#### {idx}. General comment from @{author}:")
-            sections.append(f"> {body}\n")
+            comment_sections.append(f"#### {idx}. General comment from @{author}:")
+            comment_sections.append(f"> {body}\n")
 
-    sections.append(
-        "---\n\n"
-        "### Instructions:\n"
-        "1. Address all feedback requested above thoroughly and carefully.\n"
-        "2. Ensure all tests and `make check` pass locally.\n"
-        "3. Update `docs/PR_DESCRIPTION.md` to note the fixes or investigations made.\n"
-        "4. If answering questions or inquiries that do not require code changes, "
-        "provide a thorough, factual response explaining your findings.\n"
-        "5. Conclude your turn with a clear summary explaining how the feedback was addressed "
-        "(this response will be automatically posted back to the GitHub PR comment thread)."
-    )
+    if (
+        prompt_path is not None
+        and is_phase_0000_prompt(prompt_path)
+        and not (IMPLEMENTED_DIR / prompt_path.name).is_file()
+    ):
+        return build_phase_0000_interview_prompt(
+            REPO_ROOT, prompt_path, int(pr_number), comment_sections
+        )
+
+    sections: list[str] = [
+        f"Reviewer feedback has been submitted on Pull Request #{pr_number} ('{pr_title}').",
+        "\n### Review Comments to Address:\n",
+        *comment_sections,
+        (
+            "---\n\n"
+            "### Instructions:\n"
+            "1. Address all feedback requested above thoroughly and carefully.\n"
+            "2. Ensure all tests and `make check` pass locally.\n"
+            "3. Update `docs/PR_DESCRIPTION.md` to note the fixes or investigations made.\n"
+            "4. If answering questions or inquiries that do not require code changes, "
+            "provide a thorough, factual response explaining your findings.\n"
+            "5. Conclude your turn with a clear summary explaining how the feedback was addressed "
+            "(this response will be automatically posted back to the GitHub PR comment thread)."
+        ),
+    ]
     return "\n".join(sections)
 
 
@@ -2559,7 +2668,12 @@ def address_pr_feedback(
     initial_sha = initial_sha_res.stdout.strip() if initial_sha_res.returncode == 0 else ""
 
     # 2. Build the feedback prompt
-    feedback_prompt = build_review_feedback_prompt(pr_number, pr_title, new_comments)
+    if is_phase_0000_prompt(prompt_path):
+        feedback_prompt = build_review_feedback_prompt(
+            pr_number, pr_title, new_comments, prompt_path=prompt_path
+        )
+    else:
+        feedback_prompt = build_review_feedback_prompt(pr_number, pr_title, new_comments)
 
     # 3. Resume the session with agy -c
     logger.info("Resuming session for %s with reviewer feedback...", prompt_path.name)
@@ -2611,23 +2725,61 @@ def address_pr_feedback(
 
     # 7. Post a detailed reply comment on GitHub PR
     agent_summary = extract_latest_agent_summary()
-    commit_note = (
-        f"in commit `{current_sha}`"
-        if has_new_commit
-        else "(findings verified without code changes)"
-    )
-    comment_parts = [
-        f"{DAEMON_TAG} Addressed {len(new_comments)} review comment(s) {commit_note}.",
-    ]
-    if agent_summary:
-        agent_summary = truncate_pr_comment(agent_summary)
-        comment_parts.append(f"### Findings & Response:\n{agent_summary}")
+    if is_phase_0000_prompt(prompt_path):
+        pr_desc_candidate = (
+            PR_DESC_PATH
+            if PR_DESC_PATH != _DEFAULT_PR_DESC_PATH
+            else REPO_ROOT / "docs" / "PR_DESCRIPTION.md"
+        )
+        if pr_desc_candidate.is_file():
+            updated_body = build_pr_description(prompt_path, branch_name)
+            run_cmd(
+                [gh_bin, "pr", "edit", str(pr_number), "--body", updated_body],
+                check=False,
+            )
 
-    comment_parts.append(
-        "Definition of Done checks (`make check`) passed locally. Ready for re-review."
-    )
-    comment_body = "\n\n".join(comment_parts)
-    _make_github_forge(gh_bin).post_pr_comment(int(pr_number), comment_body)
+        questions = extract_phase_0000_questions(REPO_ROOT, agent_summary)
+        if questions and not (IMPLEMENTED_DIR / prompt_path.name).is_file():
+            comment_body = f"{DAEMON_TAG}\n\n{format_phase_0000_questions_comment(questions)}"
+            _make_github_forge(gh_bin).post_pr_comment(int(pr_number), comment_body)
+        elif (IMPLEMENTED_DIR / prompt_path.name).is_file() or is_phase_0000_complete(
+            REPO_ROOT, prompt_path
+        ):
+            completion_msg = format_phase_0000_completion_comment(REPO_ROOT)
+            comment_body = f"{DAEMON_TAG}\n\n{completion_msg}"
+            _make_github_forge(gh_bin).post_pr_comment(int(pr_number), comment_body)
+        else:
+            commit_note = (
+                f"in commit `{current_sha}`"
+                if has_new_commit
+                else "(findings verified without code changes)"
+            )
+            comment_parts = [
+                f"{DAEMON_TAG} Addressed {len(new_comments)} review comment(s) {commit_note}.",
+            ]
+            if agent_summary:
+                agent_summary_trunc = truncate_pr_comment(agent_summary)
+                comment_parts.append(f"### Findings & Response:\n{agent_summary_trunc}")
+            comment_body = "\n\n".join(comment_parts)
+            _make_github_forge(gh_bin).post_pr_comment(int(pr_number), comment_body)
+    else:
+        commit_note = (
+            f"in commit `{current_sha}`"
+            if has_new_commit
+            else "(findings verified without code changes)"
+        )
+        comment_parts = [
+            f"{DAEMON_TAG} Addressed {len(new_comments)} review comment(s) {commit_note}.",
+        ]
+        if agent_summary:
+            agent_summary = truncate_pr_comment(agent_summary)
+            comment_parts.append(f"### Findings & Response:\n{agent_summary}")
+
+        comment_parts.append(
+            "Definition of Done checks (`make check`) passed locally. Ready for re-review."
+        )
+        comment_body = "\n\n".join(comment_parts)
+        _make_github_forge(gh_bin).post_pr_comment(int(pr_number), comment_body)
 
     # 8. Mark comment IDs as processed and reset attempt counter
     comment_ids = [c["id"] for c in new_comments if c.get("id")]
@@ -2901,13 +3053,20 @@ def wait_for_pr_merge(
             pr_number = pr.get("number")
             pr_title = pr.get("title")
             branch_name = pr.get("headRefName")
+            is_phase_0000_branch = bool(branch_name and "0000-" in str(branch_name))
+            phase_0000_interview_in_progress = False
+            if is_phase_0000_branch and isinstance(IMPLEMENTED_DIR, Path):
+                phase_0000_interview_in_progress = not is_phase_0000_complete(REPO_ROOT)
 
             # Check for unhandled reviewer feedback/comments
             if agy_bin is not None and pr_number and branch_name:
                 unhandled_feedback = fetch_unhandled_pr_feedback(gh_bin, pr_number)
                 if unhandled_feedback:
                     current_feedback_attempts = get_review_feedback_attempts(pr_number)
-                    if current_feedback_attempts >= max_auto_heal_attempts:
+                    if (
+                        not phase_0000_interview_in_progress
+                        and current_feedback_attempts >= max_auto_heal_attempts
+                    ):
                         alert_msg = (
                             f"Circuit breaker tripped on PR #{pr_number}: "
                             f"Reached maximum review feedback attempts "
@@ -2964,7 +3123,10 @@ def wait_for_pr_merge(
                             current_feedback_attempts = increment_review_feedback_attempts(
                                 pr_number
                             )
-                            if current_feedback_attempts >= max_auto_heal_attempts:
+                            if (
+                                not phase_0000_interview_in_progress
+                                and current_feedback_attempts >= max_auto_heal_attempts
+                            ):
                                 alert_msg = (
                                     f"Circuit breaker tripped on PR #{pr_number}: "
                                     f"Reached maximum review feedback attempts "
@@ -3167,6 +3329,15 @@ def wait_for_pr_merge(
                         pr_number,
                         len(pending),
                         len(passed),
+                        wait_str,
+                        enter_hint,
+                    )
+                elif phase_0000_interview_in_progress:
+                    logger.info(
+                        "💬 PR #%s ('%s') Phase 0000 bootstrap interview is in progress. "
+                        "Waiting for user replies to interview questions... (re-checking in %s%s)",
+                        pr_number,
+                        pr_title,
                         wait_str,
                         enter_hint,
                     )
@@ -3688,10 +3859,25 @@ def main() -> None:
                         next_prompt.name,
                     )
                 else:
-                    logger.info(
-                        "✨ Queue is empty! All prompts in prompts/queued/ have been implemented."
-                    )
-                    break
+                    bootstrap_state = detect_repo_bootstrap_state(REPO_ROOT)
+                    if (
+                        bootstrap_state
+                        in {RepoBootstrapState.BRIEF_ONLY, RepoBootstrapState.EMPTY_REPO}
+                        and not (IMPLEMENTED_DIR / PHASE_0000_FILENAME).is_file()
+                    ):
+                        logger.info(
+                            "Repository bootstrap state detected: %s. Scaffolding %s...",
+                            bootstrap_state.value,
+                            PHASE_0000_FILENAME,
+                        )
+                        ensure_base_branch_initialized(REPO_ROOT, BASE_BRANCH, run_cmd_fn=run_cmd)
+                        next_prompt = scaffold_phase_0000_prompt(REPO_ROOT, bootstrap_state)
+                    else:
+                        logger.info(
+                            "✨ Queue is empty! All prompts in prompts/queued/ "
+                            "have been implemented."
+                        )
+                        break
 
             logger.info("🚀 Next prompt to implement: %s", next_prompt.name)
 
@@ -3797,6 +3983,15 @@ def main() -> None:
                 commit_msg = f"feat({next_prompt.stem}): implement {next_prompt.stem}"
                 run_cmd(["git", "commit", "-m", commit_msg])
                 new_commits = count_new_commits(branch_name)
+
+        if (
+            new_commits == 0
+            and is_phase_0000_prompt(next_prompt)
+            and is_phase_0000_interview_pending(REPO_ROOT, next_prompt)
+        ):
+            commit_msg = f"chore({next_prompt.stem}): bootstrap interview questions"
+            run_cmd(["git", "commit", "--allow-empty", "-m", commit_msg], check=False)
+            new_commits = count_new_commits(branch_name)
 
         if new_commits == 0:
             logger.error("No commits were made by the session on branch '%s'.", branch_name)
