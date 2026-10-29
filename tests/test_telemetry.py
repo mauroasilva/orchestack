@@ -188,6 +188,7 @@ def test_parse_claude_session_and_events(tmp_path: Path) -> None:
             "timestamp": "2026-10-28T09:00:45Z",
             "usage": {
                 "input_tokens": 4000,
+                "cache_creation_input_tokens": 500,
                 "cache_read_input_tokens": 1000,
                 "output_tokens": 1500,
             },
@@ -203,9 +204,11 @@ def test_parse_claude_session_and_events(tmp_path: Path) -> None:
     assert parsed.prompt_slug == "0002-forge"
     assert parsed.num_turns == 6
     assert parsed.input_tokens == 4000
+    assert parsed.cache_write_tokens == 500
+    assert parsed.cache_read_tokens == 1000
     assert parsed.cached_input_tokens == 1000
     assert parsed.output_tokens == 1500
-    assert parsed.total_tokens == 6500
+    assert parsed.total_tokens == 7000
     assert parsed.estimated_cost_usd == 0.1425
     assert parsed.duration_seconds == 45.0
     assert parsed.tool_calls_breakdown == {"Bash": 1, "Edit": 1}
@@ -273,6 +276,8 @@ def test_parse_codex_session_and_events(tmp_path: Path) -> None:
     assert parsed.prompt_num == "0003"
     assert parsed.prompt_slug == "0003-agent"
     assert parsed.input_tokens == 3000
+    assert parsed.cache_write_tokens == 0
+    assert parsed.cache_read_tokens == 500
     assert parsed.cached_input_tokens == 500
     assert parsed.output_tokens == 800
     assert parsed.total_tokens == 4300

@@ -36,27 +36,139 @@ IDE_STATE_VSCDB = (
     / "state.vscdb"
 )
 
-# Default pricing per 1M tokens (USD)
+# Default pricing per 1M tokens (USD) across unified pricing buckets:
+# - input_tokens: uncached input (1.0x base input rate)
+# - cache_write_tokens: cache creation / write (1.25x on Claude 5-min TTL; 0/1.0x on OpenAI/Gemini)
+# - cache_read_tokens: cache hit / read (0.10x on Claude; 0.25x-0.50x on OpenAI/Gemini)
+# - output_tokens: output + thinking/reasoning tokens
 INPUT_COST_PER_MILLION = 1.25
-CACHED_INPUT_COST_PER_MILLION = 0.3125
+CACHE_WRITE_COST_PER_MILLION = 1.25
+CACHE_READ_COST_PER_MILLION = 0.3125
+CACHED_INPUT_COST_PER_MILLION = CACHE_READ_COST_PER_MILLION
 OUTPUT_COST_PER_MILLION = 5.00
 
 CLAUDE_INPUT_COST_PER_MILLION = 3.00
-CLAUDE_CACHED_COST_PER_MILLION = 0.30
+CLAUDE_CACHE_WRITE_COST_PER_MILLION = 3.75
+CLAUDE_CACHE_READ_COST_PER_MILLION = 0.30
+CLAUDE_CACHED_COST_PER_MILLION = CLAUDE_CACHE_READ_COST_PER_MILLION
 CLAUDE_OUTPUT_COST_PER_MILLION = 15.00
 
 CODEX_INPUT_COST_PER_MILLION = 2.00
-CODEX_CACHED_COST_PER_MILLION = 0.50
+CODEX_CACHE_WRITE_COST_PER_MILLION = 2.00
+CODEX_CACHE_READ_COST_PER_MILLION = 0.50
+CODEX_CACHED_COST_PER_MILLION = CODEX_CACHE_READ_COST_PER_MILLION
 CODEX_OUTPUT_COST_PER_MILLION = 8.00
+
+
+@dataclass(frozen=True)
+class ModelPricing:
+    """Per-1M-token USD rates across the four unified pricing buckets."""
+
+    input_per_million: float
+    cache_write_per_million: float
+    cache_read_per_million: float
+    output_per_million: float
+
+
+MODEL_PRICING_TABLE: dict[str, ModelPricing] = {
+    # Google Gemini (Antigravity)
+    "gemini-2.5-pro": ModelPricing(1.25, 1.25, 0.3125, 5.00),
+    "gemini-3.1-pro": ModelPricing(1.25, 1.25, 0.3125, 5.00),
+    "gemini-3-pro": ModelPricing(1.25, 1.25, 0.3125, 5.00),
+    "gemini-2.5-flash-lite": ModelPricing(0.10, 0.10, 0.025, 0.40),
+    "gemini-2.5-flash": ModelPricing(0.30, 0.30, 0.075, 2.50),
+    "gemini-2.0-flash": ModelPricing(0.30, 0.30, 0.075, 2.50),
+    "gemini": ModelPricing(
+        INPUT_COST_PER_MILLION,
+        CACHE_WRITE_COST_PER_MILLION,
+        CACHE_READ_COST_PER_MILLION,
+        OUTPUT_COST_PER_MILLION,
+    ),
+    # Anthropic Claude
+    "claude-opus-4-6": ModelPricing(5.00, 6.25, 0.50, 25.00),
+    "claude-opus-4-5": ModelPricing(5.00, 6.25, 0.50, 25.00),
+    "claude-4-6-opus": ModelPricing(5.00, 6.25, 0.50, 25.00),
+    "claude-4-5-opus": ModelPricing(5.00, 6.25, 0.50, 25.00),
+    "claude-opus-4": ModelPricing(15.00, 18.75, 1.50, 75.00),
+    "claude-3-opus": ModelPricing(15.00, 18.75, 1.50, 75.00),
+    "claude-haiku-4-5": ModelPricing(1.00, 1.25, 0.10, 5.00),
+    "claude-4-5-haiku": ModelPricing(1.00, 1.25, 0.10, 5.00),
+    "claude-3-5-haiku": ModelPricing(0.80, 1.00, 0.08, 4.00),
+    "claude-3-haiku": ModelPricing(0.80, 1.00, 0.08, 4.00),
+    "claude-sonnet-4": ModelPricing(3.00, 3.75, 0.30, 15.00),
+    "claude-3-7-sonnet": ModelPricing(3.00, 3.75, 0.30, 15.00),
+    "claude-3-5-sonnet": ModelPricing(3.00, 3.75, 0.30, 15.00),
+    "claude": ModelPricing(
+        CLAUDE_INPUT_COST_PER_MILLION,
+        CLAUDE_CACHE_WRITE_COST_PER_MILLION,
+        CLAUDE_CACHE_READ_COST_PER_MILLION,
+        CLAUDE_OUTPUT_COST_PER_MILLION,
+    ),
+    # OpenAI Codex
+    "gpt-5": ModelPricing(1.25, 1.25, 0.125, 10.00),
+    "codex-1": ModelPricing(1.25, 1.25, 0.125, 10.00),
+    "codex-mini": ModelPricing(1.10, 1.10, 0.275, 4.40),
+    "o4-mini": ModelPricing(1.10, 1.10, 0.275, 4.40),
+    "o3-mini": ModelPricing(1.10, 1.10, 0.275, 4.40),
+    "gpt-4.1-mini": ModelPricing(0.40, 0.40, 0.10, 1.60),
+    "gpt-4.1-nano": ModelPricing(0.10, 0.10, 0.025, 0.40),
+    "gpt-4o": ModelPricing(2.50, 2.50, 1.25, 10.00),
+    "gpt-4.1": ModelPricing(2.00, 2.00, 0.50, 8.00),
+    "o3": ModelPricing(2.00, 2.00, 0.50, 8.00),
+    "codex": ModelPricing(
+        CODEX_INPUT_COST_PER_MILLION,
+        CODEX_CACHE_WRITE_COST_PER_MILLION,
+        CODEX_CACHE_READ_COST_PER_MILLION,
+        CODEX_OUTPUT_COST_PER_MILLION,
+    ),
+}
+
+
+def get_model_pricing(model: str = "", backend: str = "agy") -> ModelPricing:
+    """Resolve per-1M-token pricing from model identifier and agent backend fallback."""
+    norm_model = model.strip().lower()
+    if norm_model in MODEL_PRICING_TABLE:
+        return MODEL_PRICING_TABLE[norm_model]
+
+    for key in sorted(MODEL_PRICING_TABLE.keys(), key=len, reverse=True):
+        if key in norm_model:
+            return MODEL_PRICING_TABLE[key]
+
+    norm_backend = backend.strip().lower()
+    if norm_backend == "claude":
+        return MODEL_PRICING_TABLE["claude"]
+    if norm_backend == "codex":
+        return MODEL_PRICING_TABLE["codex"]
+    return MODEL_PRICING_TABLE["gemini"]
+
+
+def calculate_token_cost(
+    model: str = "",
+    *,
+    backend: str = "agy",
+    input_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    output_tokens: int = 0,
+) -> float:
+    """Calculate USD cost from the 4 unified token buckets and model/backend pricing."""
+    pricing = get_model_pricing(model=model, backend=backend)
+    return (
+        input_tokens * pricing.input_per_million
+        + cache_write_tokens * pricing.cache_write_per_million
+        + cache_read_tokens * pricing.cache_read_per_million
+        + output_tokens * pricing.output_per_million
+    ) / 1_000_000.0
+
 
 # Known UUID mapping for foundational pair-programming sessions (0001-0008)
 FOUNDATIONAL_SESSIONS: dict[str, str] = {
-    "99c957ab-37b8-408c-9983-01a771c34c8f": "0001",
-    "4dbfff7c-1f1f-4f27-9c28-c15b8f88fd3d": "0002",
-    "ca2a37ff-6bc0-42b2-8727-5d6f2a8476ff": "0003",
-    "c38d200c-d369-4aa1-875c-08b23b750ed3": "0004",
-    "3487dfb2-2e6e-4302-aefa-68d618429292": "0005",
-    "65e9c037-daad-4db6-a82b-5ed0157db297": "0006",
+    "548deadd-ce26-47e0-92a4-4a5004dbe9c4": "0001",
+    "27b57106-6bb8-4335-8465-44f87941b143": "0002",
+    "eb7433c9-a221-4cf1-947b-f484b2867504": "0003",
+    "10e31f4e-14e0-4a8b-b37d-7feb9243ff02": "0004",
+    "41485088-753c-4a8e-9cc8-f3f959b48f87": "0005",
+    "1e606897-2bb7-484c-8472-9229a45a9d0c": "0006",
     "833a355e-f199-4bd8-a57a-761d36be8f42": "0007",
     "ccd6d114-2b66-4ace-b874-f33832bfd63e": "0008",
 }
@@ -74,6 +186,8 @@ class SessionTelemetry:
     total_steps: int = 0
     num_turns: int = 0
     input_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
     cached_input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -89,10 +203,31 @@ class SessionTelemetry:
     source_path: str = ""
 
     def __post_init__(self) -> None:
-        if self.total_tokens == 0 and (
-            self.input_tokens or self.cached_input_tokens or self.output_tokens
-        ):
-            self.total_tokens = self.input_tokens + self.cached_input_tokens + self.output_tokens
+        if self.cache_read_tokens == 0 and self.cached_input_tokens > 0:
+            self.cache_read_tokens = self.cached_input_tokens
+        elif self.cached_input_tokens == 0 and self.cache_read_tokens > 0:
+            self.cached_input_tokens = self.cache_read_tokens
+
+        bucket_sum = (
+            self.input_tokens
+            + self.cache_write_tokens
+            + self.cache_read_tokens
+            + self.output_tokens
+        )
+        if self.total_tokens == 0 and bucket_sum > 0:
+            self.total_tokens = bucket_sum
+        if self.estimated_cost_usd == 0.0 and bucket_sum > 0:
+            self.estimated_cost_usd = round(
+                calculate_token_cost(
+                    input_tokens=self.input_tokens,
+                    cache_write_tokens=self.cache_write_tokens,
+                    cache_read_tokens=self.cache_read_tokens,
+                    output_tokens=self.output_tokens,
+                    model=self.model,
+                    backend=self.backend,
+                ),
+                4,
+            )
         if self.num_turns == 0 and self.total_steps > 0:
             self.num_turns = self.total_steps
 
@@ -108,10 +243,14 @@ class SessionTelemetry:
             "total_steps": self.total_steps,
             "num_turns": self.num_turns,
             "input_tokens": self.input_tokens,
-            "cached_input_tokens": self.cached_input_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cached_input_tokens": self.cache_read_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
-            "input_tokens_estimate": self.input_tokens + self.cached_input_tokens,
+            "input_tokens_estimate": (
+                self.input_tokens + self.cache_write_tokens + self.cache_read_tokens
+            ),
             "output_tokens_estimate": self.output_tokens,
             "total_tokens_estimate": self.total_tokens,
             "estimated_cost_usd": round(self.estimated_cost_usd, 4),
@@ -404,15 +543,33 @@ def parse_antigravity_transcript(
         return None
 
     total_steps = 0
-    input_tokens = 0
-    cached_tokens = 0
-    output_tokens = 0
+    explicit_input_tokens = 0
+    explicit_cache_write_tokens = 0
+    explicit_cache_read_tokens = 0
+    explicit_output_tokens = 0
+    has_explicit_usage = False
+    heuristic_input_tokens = 0
+    heuristic_output_tokens = 0
     tool_counts: dict[str, int] = {}
     timestamps: list[str] = []
     user_prompts: list[str] = []
     text_sample: list[str] = []
     denials_count = 0
     model_name = "gemini"
+
+    _usage_keys = (
+        "prompt_tokens",
+        "input_tokens",
+        "cache_write_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_tokens",
+        "cache_read_input_tokens",
+        "cached_input_tokens",
+        "cached_content_token_count",
+        "completion_tokens",
+        "output_tokens",
+        "candidates_token_count",
+    )
 
     try:
         with target_file.open("r", encoding="utf-8", errors="ignore") as f:
@@ -449,31 +606,45 @@ def parse_antigravity_transcript(
                 if "permission denied" in content.lower() or "auto-denied" in content.lower():
                     denials_count += 1
 
-                usage = data.get("usage") or data.get("token_usage") or {}
-                if isinstance(usage, dict) and (
-                    usage.get("prompt_tokens") or usage.get("input_tokens")
+                raw_usage = data.get("usage") or data.get("token_usage")
+                usage_src: Mapping[str, Any] | None = None
+                if isinstance(raw_usage, Mapping) and any(
+                    raw_usage.get(k) is not None for k in _usage_keys
                 ):
-                    in_t = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-                    cache_t = int(
-                        usage.get("cached_input_tokens")
-                        or usage.get("cache_read_input_tokens")
-                        or usage.get("cached_content_token_count")
+                    usage_src = raw_usage
+                elif any(data.get(k) is not None for k in _usage_keys):
+                    usage_src = data
+
+                if usage_src is not None:
+                    has_explicit_usage = True
+                    in_t = int(usage_src.get("prompt_tokens") or usage_src.get("input_tokens") or 0)
+                    cache_w_t = int(
+                        usage_src.get("cache_write_tokens")
+                        or usage_src.get("cache_creation_input_tokens")
+                        or 0
+                    )
+                    cache_r_t = int(
+                        usage_src.get("cache_read_tokens")
+                        or usage_src.get("cached_input_tokens")
+                        or usage_src.get("cache_read_input_tokens")
+                        or usage_src.get("cached_content_token_count")
                         or 0
                     )
                     out_t = int(
-                        usage.get("completion_tokens")
-                        or usage.get("output_tokens")
-                        or usage.get("candidates_token_count")
+                        usage_src.get("completion_tokens")
+                        or usage_src.get("output_tokens")
+                        or usage_src.get("candidates_token_count")
                         or 0
                     )
-                    input_tokens += in_t
-                    cached_tokens += cache_t
-                    output_tokens += out_t
+                    explicit_input_tokens += in_t
+                    explicit_cache_write_tokens += cache_w_t
+                    explicit_cache_read_tokens += cache_r_t
+                    explicit_output_tokens += out_t
                 else:
                     if step_type in ("USER_INPUT", "SYSTEM_MESSAGE", "GENERIC", "CHECKPOINT"):
-                        input_tokens += max(1, len(content) // 4)
+                        heuristic_input_tokens += max(1, len(content) // 4)
                     elif step_type == "PLANNER_RESPONSE":
-                        output_tokens += max(1, (len(content) + len(thinking)) // 4)
+                        heuristic_output_tokens += max(1, (len(content) + len(thinking)) // 4)
 
                 for tc in data.get("tool_calls") or []:
                     if not isinstance(tc, dict):
@@ -490,13 +661,18 @@ def parse_antigravity_transcript(
                         or tc.get("args")
                         or ""
                     )
-                    input_tokens += len(str(args)) // 4
+                    heuristic_input_tokens += len(str(args)) // 4
 
     except PermissionError:
         return None
     except Exception as e:
         print(f"Warning: error reading {target_file}: {e}", file=sys.stderr)
         return None
+
+    input_tokens = explicit_input_tokens if has_explicit_usage else heuristic_input_tokens
+    cache_write_tokens = explicit_cache_write_tokens if has_explicit_usage else 0
+    cache_read_tokens = explicit_cache_read_tokens if has_explicit_usage else 0
+    output_tokens = explicit_output_tokens if has_explicit_usage else heuristic_output_tokens
 
     title = db_titles.get(conv_id, "")
     prompt_num = infer_prompt_num(
@@ -509,11 +685,14 @@ def parse_antigravity_transcript(
     )
 
     duration_s = _compute_duration_from_timestamps(timestamps)
-    est_cost = (
-        input_tokens * INPUT_COST_PER_MILLION
-        + cached_tokens * CACHED_INPUT_COST_PER_MILLION
-        + output_tokens * OUTPUT_COST_PER_MILLION
-    ) / 1_000_000.0
+    est_cost = calculate_token_cost(
+        model_name,
+        backend="agy",
+        input_tokens=input_tokens,
+        cache_write_tokens=cache_write_tokens,
+        cache_read_tokens=cache_read_tokens,
+        output_tokens=output_tokens,
+    )
 
     slug = slug_map.get(prompt_num or "", f"other-{conv_id[:8]}")
     mtime_val = float(files.get("mtime") or 0.0)
@@ -527,9 +706,11 @@ def parse_antigravity_transcript(
         total_steps=total_steps,
         num_turns=total_steps,
         input_tokens=input_tokens,
-        cached_input_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cached_input_tokens=cache_read_tokens,
         output_tokens=output_tokens,
-        total_tokens=input_tokens + cached_tokens + output_tokens,
+        total_tokens=input_tokens + cache_write_tokens + cache_read_tokens + output_tokens,
         estimated_cost_usd=round(est_cost, 4),
         duration_seconds=round(duration_s, 1),
         start_time=timestamps[0] if timestamps else None,
@@ -575,11 +756,13 @@ def parse_claude_events_telemetry(
     total_steps = 0
     num_turns = 0
     result_input_tokens = 0
-    result_cached_tokens = 0
+    result_cache_write_tokens = 0
+    result_cache_read_tokens = 0
     result_output_tokens = 0
     has_result_usage = False
     assistant_input_tokens = 0
-    assistant_cached_tokens = 0
+    assistant_cache_write_tokens = 0
+    assistant_cache_read_tokens = 0
     assistant_output_tokens = 0
     explicit_cost_usd: float | None = None
     explicit_duration_ms: float = 0.0
@@ -638,8 +821,14 @@ def parse_claude_events_telemetry(
                 msg_usage = msg.get("usage")
                 if isinstance(msg_usage, dict):
                     assistant_input_tokens += int(msg_usage.get("input_tokens") or 0)
-                    assistant_cached_tokens += int(
+                    assistant_cache_write_tokens += int(
+                        msg_usage.get("cache_creation_input_tokens")
+                        or msg_usage.get("cache_write_tokens")
+                        or 0
+                    )
+                    assistant_cache_read_tokens += int(
                         msg_usage.get("cache_read_input_tokens")
+                        or msg_usage.get("cache_read_tokens")
                         or msg_usage.get("cached_input_tokens")
                         or 0
                     )
@@ -686,8 +875,14 @@ def parse_claude_events_telemetry(
             if isinstance(usage, dict):
                 has_result_usage = True
                 result_input_tokens += int(usage.get("input_tokens") or 0)
-                result_cached_tokens += int(
-                    usage.get("cache_read_input_tokens") or usage.get("cached_input_tokens") or 0
+                result_cache_write_tokens += int(
+                    usage.get("cache_creation_input_tokens") or usage.get("cache_write_tokens") or 0
+                )
+                result_cache_read_tokens += int(
+                    usage.get("cache_read_input_tokens")
+                    or usage.get("cache_read_tokens")
+                    or usage.get("cached_input_tokens")
+                    or 0
                 )
                 result_output_tokens += int(usage.get("output_tokens") or 0)
 
@@ -703,23 +898,32 @@ def parse_claude_events_telemetry(
         session_id = source_path.stem if source_path is not None else "claude-session"
 
     input_tokens = result_input_tokens if has_result_usage else assistant_input_tokens
-    cached_tokens = result_cached_tokens if has_result_usage else assistant_cached_tokens
+    cache_write_tokens = (
+        result_cache_write_tokens if has_result_usage else assistant_cache_write_tokens
+    )
+    cache_read_tokens = (
+        result_cache_read_tokens if has_result_usage else assistant_cache_read_tokens
+    )
     output_tokens = result_output_tokens if has_result_usage else assistant_output_tokens
-    total_tokens = input_tokens + cached_tokens + output_tokens
+    total_tokens = input_tokens + cache_write_tokens + cache_read_tokens + output_tokens
 
     if explicit_duration_ms > 0:
         duration_s = explicit_duration_ms / 1000.0
     else:
         duration_s = _compute_duration_from_timestamps(timestamps)
 
+    effective_model = model or "claude"
     if explicit_cost_usd is not None:
         cost_usd = explicit_cost_usd
     else:
-        cost_usd = (
-            input_tokens * CLAUDE_INPUT_COST_PER_MILLION
-            + cached_tokens * CLAUDE_CACHED_COST_PER_MILLION
-            + output_tokens * CLAUDE_OUTPUT_COST_PER_MILLION
-        ) / 1_000_000.0
+        cost_usd = calculate_token_cost(
+            effective_model,
+            backend="claude",
+            input_tokens=input_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_read_tokens=cache_read_tokens,
+            output_tokens=output_tokens,
+        )
 
     src_name = source_path.name if source_path is not None else ""
     prompt_num = infer_prompt_num(
@@ -738,13 +942,15 @@ def parse_claude_events_telemetry(
     return SessionTelemetry(
         session_id=session_id,
         backend="claude",
-        model=model or "claude",
+        model=effective_model,
         prompt_num=prompt_num,
         prompt_slug=slug,
         total_steps=total_steps,
         num_turns=num_turns if num_turns > 0 else total_steps,
         input_tokens=input_tokens,
-        cached_input_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cached_input_tokens=cache_read_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
         estimated_cost_usd=round(cost_usd, 4),
@@ -834,7 +1040,8 @@ def parse_codex_events_telemetry(
     total_steps = 0
     num_turns = 0
     input_tokens = 0
-    cached_tokens = 0
+    cache_write_tokens = 0
+    cache_read_tokens = 0
     output_tokens = 0
     explicit_cost_usd: float | None = None
     explicit_duration_ms: float = 0.0
@@ -920,12 +1127,19 @@ def parse_codex_events_telemetry(
             usage = ev.get("usage")
             if isinstance(usage, dict):
                 input_tokens += int(usage.get("input_tokens") or 0)
-                cached_val = usage.get("cached_input_tokens")
+                cache_write_tokens += int(
+                    usage.get("cache_write_tokens") or usage.get("cache_creation_input_tokens") or 0
+                )
+                cached_val = (
+                    usage.get("cache_read_tokens")
+                    if usage.get("cache_read_tokens") is not None
+                    else usage.get("cached_input_tokens")
+                )
                 if cached_val is None:
                     details = usage.get("input_tokens_details")
                     if isinstance(details, dict):
                         cached_val = details.get("cached_tokens")
-                cached_tokens += int(cached_val or 0)
+                cache_read_tokens += int(cached_val or 0)
                 output_tokens += int(usage.get("output_tokens") or 0)
 
             cost_val = ev.get("total_cost_usd") or ev.get("cost_usd")
@@ -947,20 +1161,24 @@ def parse_codex_events_telemetry(
         else:
             session_id = "codex-session"
 
-    total_tokens = input_tokens + cached_tokens + output_tokens
+    total_tokens = input_tokens + cache_write_tokens + cache_read_tokens + output_tokens
     if explicit_duration_ms > 0:
         duration_s = explicit_duration_ms / 1000.0
     else:
         duration_s = _compute_duration_from_timestamps(timestamps)
 
+    effective_model = model or "codex"
     if explicit_cost_usd is not None:
         cost_usd = explicit_cost_usd
     else:
-        cost_usd = (
-            input_tokens * CODEX_INPUT_COST_PER_MILLION
-            + cached_tokens * CODEX_CACHED_COST_PER_MILLION
-            + output_tokens * CODEX_OUTPUT_COST_PER_MILLION
-        ) / 1_000_000.0
+        cost_usd = calculate_token_cost(
+            effective_model,
+            backend="codex",
+            input_tokens=input_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_read_tokens=cache_read_tokens,
+            output_tokens=output_tokens,
+        )
 
     src_name = source_path.name if source_path is not None else ""
     prompt_num = infer_prompt_num(
@@ -979,13 +1197,15 @@ def parse_codex_events_telemetry(
     return SessionTelemetry(
         session_id=session_id,
         backend="codex",
-        model=model or "codex",
+        model=effective_model,
         prompt_num=prompt_num,
         prompt_slug=slug,
         total_steps=total_steps,
         num_turns=num_turns if num_turns > 0 else total_steps,
         input_tokens=input_tokens,
-        cached_input_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cached_input_tokens=cache_read_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
         estimated_cost_usd=round(cost_usd, 4),
@@ -1106,30 +1326,54 @@ def parse_daemon_log_file(
             m_num = re.match(r"^(\d{4})", slug)
             pnum = m_num.group(1) if m_num else None
             backend = str(rec.get("backend") or rec.get("agent") or "agy")
+            model_str = str(rec.get("model") or ("gemini" if backend == "agy" else backend))
             sid = str(rec.get("session_id") or rec.get("conv_id") or f"metrics-{slug}-{idx}")
             in_tok = int(rec.get("input_tokens") or rec.get("input_tokens_estimate") or 0)
-            cache_tok = int(rec.get("cached_input_tokens") or 0)
+            cache_write_tok = int(
+                rec.get("cache_write_tokens") or rec.get("cache_creation_input_tokens") or 0
+            )
+            cache_read_tok = int(
+                rec.get("cache_read_tokens")
+                or rec.get("cached_input_tokens")
+                or rec.get("cache_read_input_tokens")
+                or 0
+            )
             out_tok = int(rec.get("output_tokens") or rec.get("output_tokens_estimate") or 0)
             tot_tok = int(
                 rec.get("total_tokens")
                 or rec.get("total_tokens_estimate")
-                or (in_tok + cache_tok + out_tok)
+                or (in_tok + cache_write_tok + cache_read_tok + out_tok)
+            )
+            raw_cost = float(rec.get("estimated_cost_usd") or 0.0)
+            est_cost = (
+                raw_cost
+                if raw_cost > 0.0
+                else calculate_token_cost(
+                    model_str,
+                    backend=backend,
+                    input_tokens=in_tok,
+                    cache_write_tokens=cache_write_tok,
+                    cache_read_tokens=cache_read_tok,
+                    output_tokens=out_tok,
+                )
             )
             tools = rec.get("tool_calls_breakdown")
             records.append(
                 SessionTelemetry(
                     session_id=sid,
                     backend=backend,
-                    model=str(rec.get("model") or backend),
+                    model=model_str,
                     prompt_num=pnum,
                     prompt_slug=slug,
                     total_steps=int(rec.get("total_steps") or 0),
                     num_turns=int(rec.get("num_turns") or rec.get("total_steps") or 0),
                     input_tokens=in_tok,
-                    cached_input_tokens=cache_tok,
+                    cache_write_tokens=cache_write_tok,
+                    cache_read_tokens=cache_read_tok,
+                    cached_input_tokens=cache_read_tok,
                     output_tokens=out_tok,
                     total_tokens=tot_tok,
-                    estimated_cost_usd=float(rec.get("estimated_cost_usd") or 0.0),
+                    estimated_cost_usd=round(est_cost, 4),
                     duration_seconds=float(rec.get("session_duration_seconds") or 0.0),
                     end_time=str(rec["timestamp"]) if rec.get("timestamp") else None,
                     tool_calls_breakdown=dict(tools) if isinstance(tools, dict) else {},
@@ -1259,6 +1503,8 @@ def format_telemetry_json(
                 "total_steps": 0,
                 "num_turns": 0,
                 "input_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_read_tokens": 0,
                 "cached_input_tokens": 0,
                 "output_tokens": 0,
                 "total_tokens": 0,
@@ -1270,7 +1516,9 @@ def format_telemetry_json(
         b_stats["total_steps"] += s.total_steps
         b_stats["num_turns"] += s.num_turns
         b_stats["input_tokens"] += s.input_tokens
-        b_stats["cached_input_tokens"] += s.cached_input_tokens
+        b_stats["cache_write_tokens"] += s.cache_write_tokens
+        b_stats["cache_read_tokens"] += s.cache_read_tokens
+        b_stats["cached_input_tokens"] += s.cache_read_tokens
         b_stats["output_tokens"] += s.output_tokens
         b_stats["total_tokens"] += s.total_tokens
         b_stats["estimated_cost_usd"] = round(
@@ -1284,7 +1532,8 @@ def format_telemetry_json(
     for pnum, sessions in sorted(by_prompt.items()):
         backends = sorted({s.backend for s in sessions})
         in_tok = sum(s.input_tokens for s in sessions)
-        cache_tok = sum(s.cached_input_tokens for s in sessions)
+        cache_write_tok = sum(s.cache_write_tokens for s in sessions)
+        cache_read_tok = sum(s.cache_read_tokens for s in sessions)
         out_tok = sum(s.output_tokens for s in sessions)
         tot_tok = sum(s.total_tokens for s in sessions)
         summary_by_prompt[pnum] = {
@@ -1294,10 +1543,12 @@ def format_telemetry_json(
             "total_steps": sum(s.total_steps for s in sessions),
             "num_turns": sum(s.num_turns for s in sessions),
             "input_tokens": in_tok,
-            "cached_input_tokens": cache_tok,
+            "cache_write_tokens": cache_write_tok,
+            "cache_read_tokens": cache_read_tok,
+            "cached_input_tokens": cache_read_tok,
             "output_tokens": out_tok,
             "total_tokens": tot_tok,
-            "input_tokens_estimate": in_tok + cache_tok,
+            "input_tokens_estimate": in_tok + cache_write_tok + cache_read_tok,
             "output_tokens_estimate": out_tok,
             "total_tokens_estimate": tot_tok,
             "estimated_cost_usd": round(sum(s.estimated_cost_usd for s in sessions), 4),
@@ -1310,7 +1561,9 @@ def format_telemetry_json(
             "total_steps": sum(s.total_steps for s in all_sessions),
             "num_turns": sum(s.num_turns for s in all_sessions),
             "input_tokens": sum(s.input_tokens for s in all_sessions),
-            "cached_input_tokens": sum(s.cached_input_tokens for s in all_sessions),
+            "cache_write_tokens": sum(s.cache_write_tokens for s in all_sessions),
+            "cache_read_tokens": sum(s.cache_read_tokens for s in all_sessions),
+            "cached_input_tokens": sum(s.cache_read_tokens for s in all_sessions),
             "output_tokens": sum(s.output_tokens for s in all_sessions),
             "total_tokens": sum(s.total_tokens for s in all_sessions),
             "estimated_cost_usd": round(sum(s.estimated_cost_usd for s in all_sessions), 4),
@@ -1335,15 +1588,20 @@ def format_telemetry_markdown(
         "## Summary by Prompt",
         "",
         (
-            "| Prompt | Name / Slug | Backends | Sessions | Steps | Input Tokens "
-            "| Cached Tokens | Output Tokens | Total Tokens | Cost (USD) | Duration |"
+            "| Prompt | Name / Slug | Backends | Sessions | Steps | input_tokens "
+            "| cache_write_tokens | cache_read_tokens | output_tokens | Total Tokens "
+            "| Cost (USD) | Duration |"
         ),
-        "| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        (
+            "| :--- | :--- | :--- | :---: | :---: | :---: "
+            "| :---: | :---: | :---: | :---: | :---: | :---: |"
+        ),
     ]
 
     tot_steps = 0
     tot_in = 0
-    tot_cache = 0
+    tot_cache_write = 0
+    tot_cache_read = 0
     tot_out = 0
     tot_tokens = 0
     tot_cost = 0.0
@@ -1360,7 +1618,8 @@ def format_telemetry_markdown(
         sess_count = len(sessions)
         steps = sum(s.total_steps for s in sessions)
         in_tok = sum(s.input_tokens for s in sessions)
-        cache_tok = sum(s.cached_input_tokens for s in sessions)
+        cache_write_tok = sum(s.cache_write_tokens for s in sessions)
+        cache_read_tok = sum(s.cache_read_tokens for s in sessions)
         out_tok = sum(s.output_tokens for s in sessions)
         tokens = sum(s.total_tokens for s in sessions)
         cost = sum(s.estimated_cost_usd for s in sessions)
@@ -1370,7 +1629,8 @@ def format_telemetry_markdown(
         tot_prompt_sessions += sess_count
         tot_steps += steps
         tot_in += in_tok
-        tot_cache += cache_tok
+        tot_cache_write += cache_write_tok
+        tot_cache_read += cache_read_tok
         tot_out += out_tok
         tot_tokens += tokens
         tot_cost += cost
@@ -1378,15 +1638,16 @@ def format_telemetry_markdown(
 
         lines.append(
             f"| `{pnum}` | `{slug}` | `{backends_str}` | {sess_count} | {steps:,} | "
-            f"{in_tok:,} | {cache_tok:,} | {out_tok:,} | ~{tokens:,} | "
-            f"${cost:.4f} | {dur_str} |"
+            f"{in_tok:,} | {cache_write_tok:,} | {cache_read_tok:,} | {out_tok:,} | "
+            f"~{tokens:,} | ${cost:.4f} | {dur_str} |"
         )
 
     tot_dur_h = tot_dur / 3600.0
     lines.append(
         f"| **Total** | **All Prompts** | **All** | **{tot_prompt_sessions}** | "
-        f"**{tot_steps:,}** | **{tot_in:,}** | **{tot_cache:,}** | **{tot_out:,}** | "
-        f"**~{tot_tokens:,}** | **${tot_cost:.4f}** | **{tot_dur_h:.1f}h** |"
+        f"**{tot_steps:,}** | **{tot_in:,}** | **{tot_cache_write:,}** | "
+        f"**{tot_cache_read:,}** | **{tot_out:,}** | **~{tot_tokens:,}** | "
+        f"**${tot_cost:.4f}** | **{tot_dur_h:.1f}h** |"
     )
 
     if all_sessions:
@@ -1396,10 +1657,14 @@ def format_telemetry_markdown(
                 "## Sessions by Backend",
                 "",
                 (
-                    "| Session ID | Backend | Model | Prompt | Turns | Input "
-                    "| Cached | Output | Cost (USD) | Duration |"
+                    "| Session ID | Backend | Model | Prompt | Turns | input_tokens "
+                    "| cache_write_tokens | cache_read_tokens | output_tokens "
+                    "| Cost (USD) | Duration |"
                 ),
-                "| :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
+                (
+                    "| :--- | :--- | :--- | :--- | :---: | :---: "
+                    "| :---: | :---: | :---: | :---: | :---: |"
+                ),
             ]
         )
         for s in all_sessions:
@@ -1407,8 +1672,9 @@ def format_telemetry_markdown(
             dur_str = f"{s.duration_seconds:.1f}s"
             lines.append(
                 f"| `{s.session_id}` | `{s.backend}` | `{s.model or s.backend}` | `{p_label}` | "
-                f"{s.num_turns} | {s.input_tokens:,} | {s.cached_input_tokens:,} | "
-                f"{s.output_tokens:,} | ${s.estimated_cost_usd:.4f} | {dur_str} |"
+                f"{s.num_turns} | {s.input_tokens:,} | {s.cache_write_tokens:,} | "
+                f"{s.cache_read_tokens:,} | {s.output_tokens:,} | "
+                f"${s.estimated_cost_usd:.4f} | {dur_str} |"
             )
 
     return "\n".join(lines)
@@ -1554,17 +1820,45 @@ def backfill_daemon_metrics_file(
 
 @dataclass
 class PhaseImplementationStats:
-    """Aggregated implementation time and token cost for a single phase."""
+    """Aggregated implementation time, unified token breakdown, and cost for a single phase."""
 
     phase_num: str
     phase_slug: str
+    model: str = "gemini"
     sessions_count: int = 0
     duration_seconds: float = 0.0
     input_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
     cached_input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.cache_read_tokens == 0 and self.cached_input_tokens > 0:
+            self.cache_read_tokens = self.cached_input_tokens
+        elif self.cached_input_tokens == 0 and self.cache_read_tokens > 0:
+            self.cached_input_tokens = self.cache_read_tokens
+        computed_total = (
+            self.input_tokens
+            + self.cache_write_tokens
+            + self.cache_read_tokens
+            + self.output_tokens
+        )
+        if self.total_tokens == 0 and computed_total > 0:
+            self.total_tokens = computed_total
+        if self.estimated_cost_usd == 0.0 and computed_total > 0:
+            self.estimated_cost_usd = round(
+                calculate_token_cost(
+                    self.model,
+                    input_tokens=self.input_tokens,
+                    cache_write_tokens=self.cache_write_tokens,
+                    cache_read_tokens=self.cache_read_tokens,
+                    output_tokens=self.output_tokens,
+                ),
+                4,
+            )
 
 
 @dataclass
@@ -1633,10 +1927,48 @@ def parse_duration_str(text: str) -> float:
         return 0.0
 
 
+def _parse_int_cell(cell: str) -> int:
+    """Parse an integer token count cell (stripping commas, bold markers, or `~`)."""
+    cleaned = cell.strip().strip("*`~ ")
+    m = re.search(r"([0-9,]+)", cleaned)
+    if not m:
+        return 0
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0
+
+
+def _parse_cost_cell(cell: str) -> float:
+    """Parse a USD cost cell (`$0.42`, `$1.60 (150,000 tokens)`) into a float."""
+    m_cost = re.search(r"\$([0-9,]+(?:\.[0-9]+)?)", cell)
+    if m_cost:
+        try:
+            return float(m_cost.group(1).replace(",", ""))
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _effective_session_model(sess: SessionTelemetry) -> str:
+    """Return the canonical model label for a session (`gemini`, `claude`, `codex`, or explicit)."""
+    if sess.model and sess.model.strip():
+        return sess.model.strip()
+    if sess.backend == "agy":
+        return "gemini"
+    return sess.backend or "gemini"
+
+
 def parse_existing_implementation_stats(
     stats_source: Path | str,
 ) -> dict[str, PhaseImplementationStats]:
-    """Parse existing phase rows from `docs/IMPLEMENTATION_STATS.md` content or file path."""
+    """Parse existing phase rows from `docs/IMPLEMENTATION_STATS.md` content or file path.
+
+    Supports both the 9-column pricing-grouped format (`Phase`, `Model`, `Implementation Time`,
+    `input_tokens`, `cache_write_tokens`, `cache_read_tokens`, `output_tokens`, `Total Tokens`,
+    `Total Cost`) and the legacy 3-column format (`Phase`, `Implementation Time`,
+    `Total Token Cost`).
+    """
     if isinstance(stats_source, Path):
         if not stats_source.is_file():
             return {}
@@ -1655,7 +1987,7 @@ def parse_existing_implementation_stats(
         cells = [c.strip() for c in stripped.strip("|").split("|")]
         if len(cells) < 3:
             continue
-        phase_cell, time_cell, cost_cell = cells[0], cells[1], cells[2]
+        phase_cell = cells[0]
         if (
             not phase_cell
             or phase_cell.lower() == "phase"
@@ -1671,32 +2003,51 @@ def parse_existing_implementation_stats(
         pnum = m_phase.group(1)
         pslug = clean_phase if m_phase.group(2) else f"prompt-{pnum}"
 
-        dur_s = parse_duration_str(time_cell)
+        if len(cells) >= 9:
+            model_cell = cells[1].strip("`* ") or "gemini"
+            dur_s = parse_duration_str(cells[2])
+            in_tok = _parse_int_cell(cells[3])
+            cache_write_tok = _parse_int_cell(cells[4])
+            cache_read_tok = _parse_int_cell(cells[5])
+            out_tok = _parse_int_cell(cells[6])
+            tot_tok = _parse_int_cell(cells[7]) or (
+                in_tok + cache_write_tok + cache_read_tok + out_tok
+            )
+            cost_usd = _parse_cost_cell(cells[8])
+            parsed[pnum] = PhaseImplementationStats(
+                phase_num=pnum,
+                phase_slug=pslug,
+                model=model_cell,
+                sessions_count=1 if (dur_s > 0 or tot_tok > 0 or cost_usd > 0) else 0,
+                duration_seconds=dur_s,
+                input_tokens=in_tok,
+                cache_write_tokens=cache_write_tok,
+                cache_read_tokens=cache_read_tok,
+                cached_input_tokens=cache_read_tok,
+                output_tokens=out_tok,
+                total_tokens=tot_tok,
+                estimated_cost_usd=cost_usd,
+            )
+        else:
+            time_cell, cost_cell = cells[1], cells[2]
+            dur_s = parse_duration_str(time_cell)
+            cost_usd = _parse_cost_cell(cost_cell)
+            tot_tokens = 0
+            m_tok = re.search(r"([0-9,]+)\s*tokens?", cost_cell, re.IGNORECASE)
+            if m_tok:
+                try:
+                    tot_tokens = int(m_tok.group(1).replace(",", ""))
+                except ValueError:
+                    tot_tokens = 0
 
-        cost_usd = 0.0
-        m_cost = re.search(r"\$([0-9,]+(?:\.[0-9]+)?)", cost_cell)
-        if m_cost:
-            try:
-                cost_usd = float(m_cost.group(1).replace(",", ""))
-            except ValueError:
-                cost_usd = 0.0
-
-        tot_tokens = 0
-        m_tok = re.search(r"([0-9,]+)\s*tokens?", cost_cell, re.IGNORECASE)
-        if m_tok:
-            try:
-                tot_tokens = int(m_tok.group(1).replace(",", ""))
-            except ValueError:
-                tot_tokens = 0
-
-        parsed[pnum] = PhaseImplementationStats(
-            phase_num=pnum,
-            phase_slug=pslug,
-            sessions_count=1 if (dur_s > 0 or tot_tokens > 0 or cost_usd > 0) else 0,
-            duration_seconds=dur_s,
-            total_tokens=tot_tokens,
-            estimated_cost_usd=cost_usd,
-        )
+            parsed[pnum] = PhaseImplementationStats(
+                phase_num=pnum,
+                phase_slug=pslug,
+                sessions_count=1 if (dur_s > 0 or tot_tokens > 0 or cost_usd > 0) else 0,
+                duration_seconds=dur_s,
+                total_tokens=tot_tokens,
+                estimated_cost_usd=cost_usd,
+            )
 
     return parsed
 
@@ -1711,12 +2062,20 @@ def _coerce_session_telemetry(item: SessionTelemetry | Mapping[str, Any]) -> Ses
         if m:
             p_num = m.group(1)
     in_tok = int(item.get("input_tokens") or item.get("input_tokens_estimate") or 0)
-    cache_tok = int(item.get("cached_input_tokens") or 0)
+    cache_write_tok = int(
+        item.get("cache_write_tokens") or item.get("cache_creation_input_tokens") or 0
+    )
+    cache_read_tok = int(
+        item.get("cache_read_tokens")
+        or item.get("cached_input_tokens")
+        or item.get("cache_read_input_tokens")
+        or 0
+    )
     out_tok = int(item.get("output_tokens") or item.get("output_tokens_estimate") or 0)
     tot_tok = int(
         item.get("total_tokens")
         or item.get("total_tokens_estimate")
-        or (in_tok + cache_tok + out_tok)
+        or (in_tok + cache_write_tok + cache_read_tok + out_tok)
     )
     return SessionTelemetry(
         session_id=str(item.get("session_id") or item.get("conv_id") or "session"),
@@ -1727,7 +2086,9 @@ def _coerce_session_telemetry(item: SessionTelemetry | Mapping[str, Any]) -> Ses
         total_steps=int(item.get("total_steps") or 0),
         num_turns=int(item.get("num_turns") or item.get("total_steps") or 0),
         input_tokens=in_tok,
-        cached_input_tokens=cache_tok,
+        cache_write_tokens=cache_write_tok,
+        cache_read_tokens=cache_read_tok,
+        cached_input_tokens=cache_read_tok,
         output_tokens=out_tok,
         total_tokens=tot_tok,
         estimated_cost_usd=float(item.get("estimated_cost_usd") or 0.0),
@@ -1816,7 +2177,7 @@ def render_implementation_stats_markdown(
     existing_stats: Mapping[str, PhaseImplementationStats] | Path | str | None = None,
     slug_map: Mapping[str, str] | None = None,
 ) -> str:
-    """Render `docs/IMPLEMENTATION_STATS.md` with per-phase implementation time and token cost."""
+    """Render `docs/IMPLEMENTATION_STATS.md` with pricing-grouped token breakdown and model cost."""
     by_prompt, effective_slug_map = _normalize_report_input(
         report,
         repo_root=repo_root,
@@ -1868,9 +2229,12 @@ def render_implementation_stats_markdown(
             else (sessions[0].prompt_slug if sessions else f"prompt-{pnum}"),
         )
 
+        live_models = list(dict.fromkeys(_effective_session_model(s) for s in sessions))
+        live_model_str = ", ".join(live_models) if live_models else (ex.model if ex else "gemini")
         live_dur = sum(s.duration_seconds for s in sessions)
         live_in = sum(s.input_tokens for s in sessions)
-        live_cache = sum(s.cached_input_tokens for s in sessions)
+        live_cache_write = sum(s.cache_write_tokens for s in sessions)
+        live_cache_read = sum(s.cache_read_tokens for s in sessions)
         live_out = sum(s.output_tokens for s in sessions)
         live_tokens = sum(s.total_tokens for s in sessions)
         live_cost = sum(s.estimated_cost_usd for s in sessions)
@@ -1889,6 +2253,12 @@ def render_implementation_stats_markdown(
             continue
 
         if has_existing and ex is not None:
+            ex_missing_breakdown = (
+                ex.input_tokens == 0
+                and ex.cache_write_tokens == 0
+                and ex.cache_read_tokens == 0
+                and ex.output_tokens == 0
+            )
             if has_live and (
                 live_tokens > ex.total_tokens
                 or round(live_cost, 2) > round(ex.estimated_cost_usd, 2)
@@ -1897,16 +2267,20 @@ def render_implementation_stats_markdown(
                     and ex.estimated_cost_usd == 0
                     and live_dur > ex.duration_seconds
                 )
+                or (ex_missing_breakdown and live_tokens == ex.total_tokens and live_tokens > 0)
             ):
                 chosen = PhaseImplementationStats(
                     phase_num=pnum,
                     phase_slug=canonical_slug,
+                    model=live_model_str,
                     sessions_count=len(sessions),
                     duration_seconds=max(live_dur, ex.duration_seconds)
                     if live_tokens == ex.total_tokens
                     else live_dur,
                     input_tokens=live_in,
-                    cached_input_tokens=live_cache,
+                    cache_write_tokens=live_cache_write,
+                    cache_read_tokens=live_cache_read,
+                    cached_input_tokens=live_cache_read,
                     output_tokens=live_out,
                     total_tokens=live_tokens,
                     estimated_cost_usd=live_cost,
@@ -1915,10 +2289,13 @@ def render_implementation_stats_markdown(
                 chosen = PhaseImplementationStats(
                     phase_num=pnum,
                     phase_slug=canonical_slug,
+                    model=ex.model or live_model_str,
                     sessions_count=max(ex.sessions_count, len(sessions)),
                     duration_seconds=ex.duration_seconds,
                     input_tokens=ex.input_tokens,
-                    cached_input_tokens=ex.cached_input_tokens,
+                    cache_write_tokens=ex.cache_write_tokens,
+                    cache_read_tokens=ex.cache_read_tokens,
+                    cached_input_tokens=ex.cache_read_tokens,
                     output_tokens=ex.output_tokens,
                     total_tokens=ex.total_tokens,
                     estimated_cost_usd=ex.estimated_cost_usd,
@@ -1927,10 +2304,13 @@ def render_implementation_stats_markdown(
             chosen = PhaseImplementationStats(
                 phase_num=pnum,
                 phase_slug=canonical_slug,
+                model=live_model_str,
                 sessions_count=len(sessions),
                 duration_seconds=live_dur,
                 input_tokens=live_in,
-                cached_input_tokens=live_cache,
+                cache_write_tokens=live_cache_write,
+                cache_read_tokens=live_cache_read,
+                cached_input_tokens=live_cache_read,
                 output_tokens=live_out,
                 total_tokens=live_tokens,
                 estimated_cost_usd=live_cost,
@@ -1942,30 +2322,49 @@ def render_implementation_stats_markdown(
         "# Implementation Statistics",
         "",
         (
-            "This document tracks the cumulative implementation time and total token cost for each "
-            "Orchestack delivery phase, aggregated across all coding agent implementation sessions "
-            "and PR/MR review or auto-heal turns."
+            "This document tracks the cumulative implementation time, pricing-grouped token "
+            "breakdown (`input_tokens`, `cache_write_tokens`, `cache_read_tokens`, "
+            "`output_tokens`), and model-based USD cost for each Orchestack delivery phase, "
+            "aggregated across all coding agent implementation sessions and PR/MR review or "
+            "auto-heal turns."
         ),
         "",
-        "| Phase | Implementation Time | Total Token Cost |",
-        "| :--- | :---: | :---: |",
+        (
+            "| Phase | Model | Implementation Time | `input_tokens` | `cache_write_tokens` "
+            "| `cache_read_tokens` | `output_tokens` | Total Tokens | Total Cost |"
+        ),
+        "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
 
     total_duration = 0.0
+    total_input = 0
+    total_cache_write = 0
+    total_cache_read = 0
+    total_output = 0
     total_tokens = 0
     total_cost = 0.0
 
     for row in phase_rows:
         total_duration += row.duration_seconds
+        total_input += row.input_tokens
+        total_cache_write += row.cache_write_tokens
+        total_cache_read += row.cache_read_tokens
+        total_output += row.output_tokens
         total_tokens += row.total_tokens
         total_cost += row.estimated_cost_usd
         dur_str = format_duration(row.duration_seconds)
-        cost_str = f"${row.estimated_cost_usd:.2f} ({row.total_tokens:,} tokens)"
-        lines.append(f"| `{row.phase_slug}` | {dur_str} | {cost_str} |")
+        lines.append(
+            f"| `{row.phase_slug}` | `{row.model}` | {dur_str} | {row.input_tokens:,} | "
+            f"{row.cache_write_tokens:,} | {row.cache_read_tokens:,} | "
+            f"{row.output_tokens:,} | {row.total_tokens:,} | ${row.estimated_cost_usd:.2f} |"
+        )
 
     tot_dur_str = format_duration(total_duration)
-    tot_cost_str = f"${total_cost:.2f} ({total_tokens:,} tokens)"
-    lines.append(f"| **Total** | **{tot_dur_str}** | **{tot_cost_str}** |")
+    lines.append(
+        f"| **Total** | **—** | **{tot_dur_str}** | **{total_input:,}** | "
+        f"**{total_cache_write:,}** | **{total_cache_read:,}** | "
+        f"**{total_output:,}** | **{total_tokens:,}** | **${total_cost:.2f}** |"
+    )
     lines.append("")
     return "\n".join(lines)
 
