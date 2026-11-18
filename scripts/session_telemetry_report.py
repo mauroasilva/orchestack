@@ -647,10 +647,26 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.repo is not None:
+        resolved_repo = args.repo.expanduser().resolve()
+        if not resolved_repo.exists():
+            sys.stderr.write(f"Error: Repository directory does not exist: {resolved_repo}\n")
+            sys.exit(1)
+        if not resolved_repo.is_dir():
+            sys.stderr.write(f"Error: Repository path is not a directory: {resolved_repo}\n")
+            sys.exit(1)
+
     if args.update_stats or args.stats_file is not None:
-        repo_path = (args.repo or REPO_ROOT).resolve()
+        repo_path = (args.repo.expanduser() if args.repo is not None else REPO_ROOT).resolve()
         stats_target = args.stats_file.expanduser().resolve() if args.stats_file else None
-        written = update_implementation_stats(repo_root=repo_path, output_path=stats_target)
+        try:
+            written = update_implementation_stats(repo_root=repo_path, output_path=stats_target)
+        except OSError as exc:
+            dest = stats_target or (repo_path / "docs" / "IMPLEMENTATION_STATS.md")
+            sys.stderr.write(
+                f"Error: Cannot write implementation stats to {dest}: {exc.strerror or exc}\n"
+            )
+            sys.exit(1)
         if (
             args.format is None
             and args.output is None
@@ -662,7 +678,7 @@ def main() -> None:
             return
 
     if args.format is not None or args.repo is not None or args.output is not None:
-        repo_path = (args.repo or REPO_ROOT).resolve()
+        repo_path = (args.repo.expanduser() if args.repo is not None else REPO_ROOT).resolve()
         slug_map = build_canonical_slug_map()
         sessions, by_prompt_objs = collect_multi_agent_telemetry(repo_root=repo_path)
         fmt = args.format or ("json" if args.json else "markdown")
@@ -671,8 +687,15 @@ def main() -> None:
         else:
             rendered = format_telemetry_markdown(sessions, by_prompt_objs, slug_map)
         if args.output is not None:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(rendered + "\n", encoding="utf-8")
+            out_target = args.output.expanduser().resolve()
+            try:
+                out_target.parent.mkdir(parents=True, exist_ok=True)
+                out_target.write_text(rendered + "\n", encoding="utf-8")
+            except OSError as exc:
+                sys.stderr.write(
+                    f"Error: Cannot write telemetry report to {out_target}: {exc.strerror or exc}\n"
+                )
+                sys.exit(1)
         else:
             print(rendered)
         return

@@ -85,6 +85,7 @@ def test_cli_status_human_and_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = tmp_path / "status_repo"
+    repo.mkdir()
     runner.invoke(
         app,
         ["init", "--repo", str(repo), "--forge", "github", "--agent", "claude"],
@@ -143,6 +144,7 @@ def test_cli_doctor_success_and_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = tmp_path / "doctor_repo"
+    repo.mkdir()
     runner.invoke(app, ["init", "--repo", str(repo), "--forge", "github", "--agent", "claude"])
 
     def fake_run_ok(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -346,3 +348,130 @@ def test_cli_telemetry_markdown_json_and_output_file(
     parsed = json.loads(out_file.read_text(encoding="utf-8"))
     assert parsed["summary"]["total_sessions"] == 3
     assert set(parsed["summary"]["by_backend"].keys()) == {"agy", "claude", "codex"}
+
+
+@pytest.mark.parametrize(
+    "argv_prefix",
+    [
+        ["init"],
+        ["status"],
+        ["doctor"],
+        ["run", "--once", "--dry-run"],
+        ["--once", "--dry-run"],
+        ["telemetry"],
+    ],
+)
+def test_cli_nonexistent_repo_path_exits_cleanly_without_traceback(
+    tmp_path: Path,
+    argv_prefix: list[str],
+) -> None:
+    missing_repo = tmp_path / "does" / "not" / "exist"
+    result = runner.invoke(app, [*argv_prefix, "--repo", str(missing_repo)])
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    combined_output = result.output
+    assert "Error: Repository directory does not exist:" in combined_output
+    assert str(missing_repo.resolve()) in combined_output
+    assert "Traceback" not in combined_output
+    assert not missing_repo.exists()
+
+
+def test_cli_init_nonexistent_unwritable_root_path_exits_cleanly() -> None:
+    uncreatable = Path("/nonexistent_orchestack_root_1701d156/to/repo")
+    if uncreatable.exists():
+        pytest.skip("Unexpected test path exists on host")
+
+    result = runner.invoke(
+        app,
+        ["init", "--repo", str(uncreatable), "--agent", "agy", "--forge", "github"],
+    )
+    assert result.exit_code == 1
+    assert "Error: Repository directory does not exist:" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_doctor_json_reports_missing_repo_root(tmp_path: Path) -> None:
+    missing_repo = tmp_path / "missing_doctor_repo"
+    result = runner.invoke(app, ["doctor", "--repo", str(missing_repo), "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["checks"][0]["name"] == "repo_root"
+    assert payload["checks"][0]["passed"] is False
+    assert "Repository directory does not exist:" in payload["checks"][0]["detail"]
+
+
+def test_cli_repo_path_pointing_to_file_exits_cleanly(tmp_path: Path) -> None:
+    regular_file = tmp_path / "not_a_dir.txt"
+    regular_file.write_text("hello\n", encoding="utf-8")
+
+    for subcmd in (["init"], ["status"], ["doctor"], ["run", "--once", "--dry-run"], ["telemetry"]):
+        result = runner.invoke(app, [*subcmd, "--repo", str(regular_file)])
+        assert result.exit_code == 1
+        assert "Error: Repository path is not a directory:" in result.output
+        assert "Traceback" not in result.output
+
+
+def test_cli_env_orchestack_repo_nonexistent_exits_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing_repo = tmp_path / "env_missing_repo"
+    monkeypatch.setenv("ORCHESTACK_REPO", str(missing_repo))
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 1
+    assert "Error: Repository directory does not exist:" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_init_validates_forge_and_agent_before_creating_dirs(tmp_path: Path) -> None:
+    repo = tmp_path / "clean_repo"
+    repo.mkdir()
+
+    bad_forge = runner.invoke(app, ["init", "--repo", str(repo), "--forge", "bitbucket"])
+    assert bad_forge.exit_code == 1
+    assert "Error: Unsupported forge provider" in bad_forge.output
+    assert not (repo / "prompts").exists()
+    assert not (repo / ".orchestack.toml").exists()
+
+    bad_agent = runner.invoke(app, ["init", "--repo", str(repo), "--agent", "unknown-agent"])
+    assert bad_agent.exit_code == 1
+    assert "Error:" in bad_agent.output
+    assert not (repo / "prompts").exists()
+    assert not (repo / ".orchestack.toml").exists()
+
+
+def test_cli_init_and_telemetry_handle_oserror_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "perm_repo"
+    repo.mkdir()
+    # Create a regular file named "prompts" so mkdir("prompts/queued") raises OSError
+    (repo / "prompts").write_text("conflict\n", encoding="utf-8")
+
+    res_init = runner.invoke(app, ["init", "--repo", str(repo)])
+    assert res_init.exit_code == 1
+    assert "Error: Cannot initialize repository at" in res_init.output
+    assert "Traceback" not in res_init.output
+
+    monkeypatch.setattr("orchestack.cli.build_canonical_slug_map", lambda root: {})
+    monkeypatch.setattr(
+        "orchestack.cli.collect_multi_agent_telemetry",
+        lambda repo_root: ([], {}),
+    )
+    bad_out_parent = tmp_path / "blocker_file"
+    bad_out_parent.write_text("file\n", encoding="utf-8")
+    res_tel = runner.invoke(
+        app,
+        [
+            "telemetry",
+            "--repo",
+            str(repo),
+            "--output",
+            str(bad_out_parent / "report.md"),
+        ],
+    )
+    assert res_tel.exit_code == 1
+    assert "Error: Cannot write telemetry report to" in res_tel.output
+    assert "Traceback" not in res_tel.output

@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import typer
 
@@ -52,6 +53,64 @@ app = typer.Typer(
 )
 
 
+_SUPPORTED_INIT_FORGES = frozenset({"auto", "github", "gitlab", "local"})
+
+
+def _format_cli_error(exc: BaseException) -> str:
+    """Format an operational exception as a concise single-line CLI error message."""
+    if isinstance(exc, tomllib.TOMLDecodeError):
+        return f"Invalid .orchestack.toml syntax: {exc}"
+    if isinstance(exc, OSError):
+        if exc.filename and exc.strerror:
+            return f"{exc.strerror}: {exc.filename}"
+        if exc.strerror and not exc.args:
+            return exc.strerror
+    return str(exc)
+
+
+def _exit_with_error(exc: BaseException, *, code: int = 1) -> NoReturn:
+    """Write a formatted error message to stderr and exit with `code`."""
+    typer.echo(f"Error: {_format_cli_error(exc)}", err=True)
+    raise typer.Exit(code) from exc
+
+
+def _resolve_repo_dir(repo_root: Path | None) -> Path:
+    """Resolve and validate that the target repository root exists and is a directory."""
+    raw_path: Path
+    if repo_root is not None:
+        raw_path = Path(repo_root)
+    elif os.environ.get("ORCHESTACK_REPO"):
+        raw_path = Path(os.environ["ORCHESTACK_REPO"])
+    elif os.environ.get("ORCHESTACK_REPO_ROOT"):
+        raw_path = Path(os.environ["ORCHESTACK_REPO_ROOT"])
+    else:
+        raw_path = Path.cwd()
+
+    try:
+        target_root = raw_path.expanduser().resolve()
+    except OSError as exc:
+        detail = exc.strerror or str(exc)
+        msg = f"Cannot resolve repository path '{raw_path}': {detail}"
+        raise OSError(msg) from exc
+
+    try:
+        exists = target_root.exists()
+        is_dir = target_root.is_dir() if exists else False
+    except OSError as exc:
+        detail = exc.strerror or str(exc)
+        msg = f"Cannot access repository path '{target_root}': {detail}"
+        raise PermissionError(msg) from exc
+
+    if not exists:
+        msg = f"Repository directory does not exist: {target_root}"
+        raise FileNotFoundError(msg)
+    if not is_dir:
+        msg = f"Repository path is not a directory: {target_root}"
+        raise NotADirectoryError(msg)
+
+    return target_root
+
+
 def _load_daemon_runner_module() -> Any:
     """Import `daemon_runner` from `scripts/` or `sys.modules`."""
     for mod_name in ("daemon_runner", "scripts.daemon_runner"):
@@ -86,7 +145,7 @@ def run_daemon(
     no_require_pr_description: bool = False,
 ) -> None:
     """Configure runtime and invoke `daemon_runner.main()` with constructed CLI arguments."""
-    target_root = (repo if repo is not None else Path.cwd()).expanduser().resolve()
+    target_root = _resolve_repo_dir(repo)
     cfg = load_repo_config(
         repo_root=target_root,
         base_branch=base_branch,
@@ -157,24 +216,23 @@ def init_repository(
     branch_prefix: str = "orchestack",
 ) -> dict[str, Any]:
     """Scaffold `.orchestack.toml`, prompt/learnings directories, and `.gitignore` entries."""
-    target_root = (repo_root if repo_root is not None else Path.cwd()).expanduser().resolve()
-    target_root.mkdir(parents=True, exist_ok=True)
+    target_root = _resolve_repo_dir(repo_root)
+    normalized_forge = forge.strip().lower()
+    if normalized_forge not in _SUPPORTED_INIT_FORGES:
+        supported = ", ".join(sorted(_SUPPORTED_INIT_FORGES))
+        msg = f"Unsupported forge provider {forge!r}. Supported providers: {supported}"
+        raise ValueError(msg)
+    normalized_agent = normalize_agent_backend_name(agent)
+
+    effective_base = base_branch if base_branch is not None else detect_base_branch(target_root)
+    effective_check = check_cmd if check_cmd is not None else detect_check_cmd(target_root)
 
     queued_dir = target_root / "prompts" / "queued"
     implemented_dir = target_root / "prompts" / "implemented"
     learnings_dir = target_root / "docs" / "learnings"
-
-    for directory in (queued_dir, implemented_dir, learnings_dir):
-        directory.mkdir(parents=True, exist_ok=True)
-        gitkeep = directory / ".gitkeep"
-        if not any(directory.iterdir()):
-            gitkeep.write_text("", encoding="utf-8")
-
-    effective_base = base_branch if base_branch is not None else detect_base_branch(target_root)
-    effective_check = check_cmd if check_cmd is not None else detect_check_cmd(target_root)
-    normalized_agent = normalize_agent_backend_name(agent)
-
     toml_path = target_root / ".orchestack.toml"
+    gitignore_path = target_root / ".gitignore"
+
     toml_content = (
         "# Orchestack repository configuration\n"
         "[repo]\n"
@@ -192,35 +250,47 @@ def init_repository(
         "require_pr_description = true\n"
         "\n"
         "[forge]\n"
-        f'provider = "{forge}"\n'
+        f'provider = "{normalized_forge}"\n'
         "\n"
         "[agent]\n"
         f'backend = "{normalized_agent}"\n'
     )
-    toml_path.write_text(toml_content, encoding="utf-8")
 
-    gitignore_path = target_root / ".gitignore"
-    existing_gitignore = ""
-    if gitignore_path.is_file():
-        existing_gitignore = gitignore_path.read_text(encoding="utf-8", errors="replace")
+    try:
+        for directory in (queued_dir, implemented_dir, learnings_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+            gitkeep = directory / ".gitkeep"
+            if not any(directory.iterdir()):
+                gitkeep.write_text("", encoding="utf-8")
 
-    lines = [line.strip() for line in existing_gitignore.splitlines()]
-    additions: list[str] = []
-    if ".daemon/" not in lines and ".daemon" not in lines:
-        additions.append(".daemon/")
-    if "docs/PR_DESCRIPTION.md" not in lines:
-        additions.append("docs/PR_DESCRIPTION.md")
+        toml_path.write_text(toml_content, encoding="utf-8")
 
-    if additions:
-        prefix = (
-            existing_gitignore
-            if not existing_gitignore or existing_gitignore.endswith("\n")
-            else existing_gitignore + "\n"
-        )
-        gitignore_path.write_text(
-            prefix + "\n".join(additions) + "\n",
-            encoding="utf-8",
-        )
+        existing_gitignore = ""
+        if gitignore_path.is_file():
+            existing_gitignore = gitignore_path.read_text(encoding="utf-8", errors="replace")
+
+        lines = [line.strip() for line in existing_gitignore.splitlines()]
+        additions: list[str] = []
+        if ".daemon/" not in lines and ".daemon" not in lines:
+            additions.append(".daemon/")
+        if "docs/PR_DESCRIPTION.md" not in lines:
+            additions.append("docs/PR_DESCRIPTION.md")
+
+        if additions:
+            prefix = (
+                existing_gitignore
+                if not existing_gitignore or existing_gitignore.endswith("\n")
+                else existing_gitignore + "\n"
+            )
+            gitignore_path.write_text(
+                prefix + "\n".join(additions) + "\n",
+                encoding="utf-8",
+            )
+    except OSError as exc:
+        detail = exc.strerror or str(exc)
+        failed_target = exc.filename or str(target_root)
+        msg = f"Cannot initialize repository at {target_root} ({failed_target}): {detail}"
+        raise OSError(msg) from exc
 
     return {
         "repo_root": str(target_root),
@@ -229,7 +299,7 @@ def init_repository(
         "implemented_dir": str(implemented_dir),
         "learnings_dir": str(learnings_dir),
         "gitignore": str(gitignore_path),
-        "forge": forge,
+        "forge": normalized_forge,
         "agent": normalized_agent,
         "base_branch": effective_base,
         "check_cmd": effective_check,
@@ -257,7 +327,8 @@ def _resolve_effective_agent(config: RepoConfig) -> str:
 
 def collect_repo_status(repo_root: Path | None = None) -> dict[str, Any]:
     """Gather repository configuration, daemon lock, prompt queue, and open PR/MR status."""
-    config = load_repo_config(repo_root=repo_root)
+    target_root = _resolve_repo_dir(repo_root)
+    config = load_repo_config(repo_root=target_root)
     detected_forge = _resolve_effective_forge(config)
     detected_agent = _resolve_effective_agent(config)
 
@@ -343,7 +414,16 @@ def run_doctor_checks(
     agent_override: str | None = None,
 ) -> tuple[bool, list[dict[str, Any]]]:
     """Run diagnostic checks on `.orchestack.toml`, git remote, forge CLI auth, and agent CLI."""
-    target_root = (repo_root if repo_root is not None else Path.cwd()).expanduser().resolve()
+    try:
+        target_root = _resolve_repo_dir(repo_root)
+    except OSError as exc:
+        return False, [
+            {
+                "name": "repo_root",
+                "passed": False,
+                "detail": _format_cli_error(exc),
+            }
+        ]
     checks: list[dict[str, Any]] = []
 
     # 1. Validate .orchestack.toml syntax and load RepoConfig
@@ -640,22 +720,25 @@ def main_callback(
         )
     )
     if has_legacy_flags:
-        run_daemon(
-            repo=repo,
-            forge=forge,
-            agent=agent,
-            once=once,
-            interval=interval,
-            auto_whitelist=auto_whitelist,
-            dry_run=dry_run,
-            base_branch=base_branch,
-            branch_prefix=branch_prefix,
-            check_cmd=check_cmd,
-            model=model,
-            effort=effort,
-            resume=resume,
-            fresh=fresh,
-        )
+        try:
+            run_daemon(
+                repo=repo,
+                forge=forge,
+                agent=agent,
+                once=once,
+                interval=interval,
+                auto_whitelist=auto_whitelist,
+                dry_run=dry_run,
+                base_branch=base_branch,
+                branch_prefix=branch_prefix,
+                check_cmd=check_cmd,
+                model=model,
+                effort=effort,
+                resume=resume,
+                fresh=fresh,
+            )
+        except (ValueError, OSError) as exc:
+            _exit_with_error(exc)
         return
 
     typer.echo(ctx.get_help())
@@ -728,22 +811,25 @@ def run_cmd_entry(
     ] = False,
 ) -> None:
     """Launch the Orchestack autonomous daemon against the target repository."""
-    run_daemon(
-        repo=repo,
-        forge=forge,
-        agent=agent,
-        once=once,
-        interval=interval,
-        auto_whitelist=auto_whitelist,
-        dry_run=dry_run,
-        base_branch=base_branch,
-        branch_prefix=branch_prefix,
-        check_cmd=check_cmd,
-        model=model,
-        effort=effort,
-        resume=resume,
-        fresh=fresh,
-    )
+    try:
+        run_daemon(
+            repo=repo,
+            forge=forge,
+            agent=agent,
+            once=once,
+            interval=interval,
+            auto_whitelist=auto_whitelist,
+            dry_run=dry_run,
+            base_branch=base_branch,
+            branch_prefix=branch_prefix,
+            check_cmd=check_cmd,
+            model=model,
+            effort=effort,
+            resume=resume,
+            fresh=fresh,
+        )
+    except (ValueError, OSError) as exc:
+        _exit_with_error(exc)
 
 
 @app.command("init")
@@ -783,9 +869,8 @@ def init_cmd_entry(
             base_branch=base_branch,
             branch_prefix=branch_prefix,
         )
-    except ValueError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(1) from exc
+    except (ValueError, OSError) as exc:
+        _exit_with_error(exc)
 
     typer.echo(f"Initialized Orchestack repository at {result['repo_root']}")
     typer.echo(f"  Config file     : {result['config_file']}")
@@ -808,7 +893,10 @@ def status_cmd_entry(
     ] = False,
 ) -> None:
     """Display target repo configuration, lock status, queued prompts, and open PRs/MRs."""
-    status_data = collect_repo_status(repo_root=repo)
+    try:
+        status_data = collect_repo_status(repo_root=repo)
+    except (ValueError, OSError) as exc:
+        _exit_with_error(exc)
     if as_json:
         typer.echo(json.dumps(status_data, indent=2))
         return
@@ -846,6 +934,12 @@ def doctor_cmd_entry(
     ] = False,
 ) -> None:
     """Run diagnostic checks on git remote, forge CLI auth, agent CLI, and `.orchestack.toml`."""
+    if not as_json:
+        try:
+            _resolve_repo_dir(repo)
+        except OSError as exc:
+            _exit_with_error(exc)
+
     all_passed, checks = run_doctor_checks(repo_root=repo)
     if as_json:
         typer.echo(json.dumps({"ok": all_passed, "checks": checks}, indent=2))
@@ -896,7 +990,6 @@ def telemetry_cmd_entry(
     ] = None,
 ) -> None:
     """Generate unified session telemetry across Antigravity, Claude Code, and Codex."""
-    target_root = (repo if repo is not None else Path.cwd()).expanduser().resolve()
     fmt = "json" if as_json else output_format.strip().lower()
     if fmt not in {"markdown", "md", "json"}:
         typer.echo(
@@ -904,20 +997,30 @@ def telemetry_cmd_entry(
         )
         raise typer.Exit(1)
 
+    try:
+        target_root = _resolve_repo_dir(repo)
+    except OSError as exc:
+        _exit_with_error(exc)
+
     slug_map = build_canonical_slug_map(target_root)
     all_sessions, by_prompt = collect_multi_agent_telemetry(repo_root=target_root)
 
     if update_stats or stats_file is not None:
         resolved_stats_file = stats_file.expanduser().resolve() if stats_file is not None else None
-        written_stats_path = update_implementation_stats(
-            repo_root=target_root,
-            output_path=resolved_stats_file,
-            report=TelemetryReport(
-                sessions=all_sessions,
-                by_prompt=by_prompt,
-                slug_map=slug_map,
-            ),
-        )
+        try:
+            written_stats_path = update_implementation_stats(
+                repo_root=target_root,
+                output_path=resolved_stats_file,
+                report=TelemetryReport(
+                    sessions=all_sessions,
+                    by_prompt=by_prompt,
+                    slug_map=slug_map,
+                ),
+            )
+        except OSError as exc:
+            dest = resolved_stats_file or (target_root / "docs" / "IMPLEMENTATION_STATS.md")
+            detail = exc.strerror or str(exc)
+            _exit_with_error(OSError(f"Cannot write implementation stats to {dest}: {detail}"))
         if output is None and not as_json and output_format == "markdown":
             typer.echo(f"Implementation stats written to {written_stats_path}")
             return
@@ -929,8 +1032,12 @@ def telemetry_cmd_entry(
 
     if output is not None:
         out_path = output.expanduser().resolve()
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(rendered + "\n", encoding="utf-8")
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(rendered + "\n", encoding="utf-8")
+        except OSError as exc:
+            detail = exc.strerror or str(exc)
+            _exit_with_error(OSError(f"Cannot write telemetry report to {out_path}: {detail}"))
         typer.echo(f"Telemetry report written to {out_path}")
     else:
         typer.echo(rendered)

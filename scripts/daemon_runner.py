@@ -3736,6 +3736,28 @@ def main() -> None:
     args = parser.parse_args()
     effort_val = None if args.effort == "none" else args.effort
 
+    explicit_repo_raw = (
+        args.repo or os.environ.get("ORCHESTACK_REPO") or os.environ.get("ORCHESTACK_REPO_ROOT")
+    )
+    validated_repo: Path | None = None
+    if explicit_repo_raw is not None:
+        try:
+            validated_repo = Path(explicit_repo_raw).expanduser().resolve()
+            repo_exists = validated_repo.exists()
+            repo_is_dir = validated_repo.is_dir() if repo_exists else False
+        except OSError as exc:
+            detail = exc.strerror or str(exc)
+            sys.stderr.write(
+                f"Error: Cannot access repository path '{explicit_repo_raw}': {detail}\n"
+            )
+            sys.exit(1)
+        if not repo_exists:
+            sys.stderr.write(f"Error: Repository directory does not exist: {validated_repo}\n")
+            sys.exit(1)
+        if not repo_is_dir:
+            sys.stderr.write(f"Error: Repository path is not a directory: {validated_repo}\n")
+            sys.exit(1)
+
     has_config_overrides = any(
         (
             args.repo is not None,
@@ -3751,17 +3773,21 @@ def main() -> None:
         )
     )
     if has_config_overrides:
-        runtime_cfg = load_repo_config(
-            repo_root=args.repo if args.repo is not None else REPO_ROOT,
-            base_branch=args.base_branch,
-            branch_prefix=args.branch_prefix,
-            check_cmd=args.check_cmd,
-            forge_type=args.forge,
-            agent_type=args.agent,
-            require_learnings=False if args.no_require_learnings else None,
-            require_pr_description=False if args.no_require_pr_description else None,
-            auto_whitelist_collaborators=args.auto_whitelist,
-        )
+        try:
+            runtime_cfg = load_repo_config(
+                repo_root=validated_repo if validated_repo is not None else REPO_ROOT,
+                base_branch=args.base_branch,
+                branch_prefix=args.branch_prefix,
+                check_cmd=args.check_cmd,
+                forge_type=args.forge,
+                agent_type=args.agent,
+                require_learnings=False if args.no_require_learnings else None,
+                require_pr_description=False if args.no_require_pr_description else None,
+                auto_whitelist_collaborators=args.auto_whitelist,
+            )
+        except (ValueError, OSError) as exc:
+            sys.stderr.write(f"Error: {exc}\n")
+            sys.exit(1)
         configure_runtime(runtime_cfg)
 
     gh_bin = get_gh_bin()

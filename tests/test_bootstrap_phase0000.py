@@ -144,6 +144,7 @@ def test_cli_status_reports_bootstrap_state(
 ) -> None:
     """`orchestack status` reports bootstrap_state in both human and JSON output."""
     repo = tmp_path / "brief_repo"
+    repo.mkdir()
     runner.invoke(app, ["init", "--repo", str(repo), "--forge", "local", "--agent", "claude"])
     (repo / "docs" / "BRIEF.md").write_text("# Brief\nMy new service.\n", encoding="utf-8")
 
