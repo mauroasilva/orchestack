@@ -32,36 +32,71 @@ Clone Orchestack and install its dependencies:
 ```bash
 git clone <orchestack-repo-url>
 cd orchestack
+uv venv --python 3.12   # optional: uv sync creates .venv automatically if omitted
 uv sync
 ```
 
-*(Optional)* Install the `orchestack` CLI onto your `PATH` so you can invoke `orchestack` directly from any directory instead of prefixing commands with `uv run`:
+*(Optional)* Activate `.venv` (`source .venv/bin/activate`) or install the `orchestack` CLI onto your `PATH` so you can invoke `orchestack` directly from any directory instead of prefixing commands with `uv run`:
 
 ```bash
 uv tool install -e .
 ```
 
-> **Tip:** All examples below use `uv run orchestack ...` from the Orchestack checkout. If you ran `uv tool install -e .`, you can shorten `uv run orchestack` to `orchestack`.
+> **Tip:** All examples below use `uv run orchestack ...` from the Orchestack checkout. If you activated `.venv` or ran `uv tool install -e .`, you can shorten `uv run orchestack` to `orchestack`.
 
 ---
 
 ## Getting Started (First-Time Guide)
 
-### Step 1: Initialize or Prepare Your Target Repository
+### Step 1: Create (or Clone) Your Target Repository
 
-You can point Orchestack at a target Git repository in **any of three starting states**:
+Orchestack requires your target repository to have an `origin` remote on **GitHub** or **GitLab** so it can open PRs/MRs, monitor CI pipelines, and respond to review comments.
+
+If you are starting a brand-new project, create the remote repository and local checkout with `gh` or `glab`:
+
+**GitHub (`gh`):**
+
+```bash
+# Create a new GitHub repository and clone it locally into ./my-project (sets `origin`)
+gh repo create my-project --private --clone
+
+# Or, to connect an existing local folder to a new GitHub repository:
+mkdir -p /path/to/target-repo && cd /path/to/target-repo
+git init -b main
+gh repo create my-project --private --source=. --remote=origin
+```
+
+**GitLab (`glab`):**
+
+```bash
+# Create a new GitLab project (with an initial README) and clone it locally into ./my-project
+glab repo create my-project --private --readme
+
+# Or, to connect an existing local folder to a new GitLab project (sets `origin`):
+mkdir -p /path/to/target-repo && cd /path/to/target-repo
+git init -b main
+glab repo create --private
+```
+
+### Step 2: Initialize or Prepare the Target Repository
+
+You can point Orchestack at your target repository in **any of three starting states**:
 
 - **Queue-ready**: Already contains numbered prompts in `prompts/queued/NNNN-slug.md` (e.g., `0001-initial-api.md`).
 - **Brief-only**: Contains a `docs/BRIEF.md` describing what you want built. Orchestack automatically runs `Phase 0000` to draft `docs/PLAN.md` and generate queued prompts, interviewing you via PR/MR comments if anything needs clarification.
-- **Empty repository**: Even a brand-new repository works—Orchestack opens a `Phase 0000` bootstrap PR/MR and conducts a numbered-question interview in PR comments to define your architecture and prompt queue.
+- **Empty repository**: Even a brand-new repository works—Orchestack initializes `main` if needed, opens a `Phase 0000` bootstrap PR/MR, and conducts a numbered-question interview in PR/MR comments to define your architecture and prompt queue.
 
-To scaffold `.orchestack.toml`, `prompts/{queued,implemented}/`, `docs/learnings/`, and `.gitignore` entries in a target repository:
+To scaffold `.orchestack.toml`, `prompts/{queued,implemented}/`, `docs/learnings/`, and `.gitignore` entries in the target repository (and commit them onto `main` so feature branches inherit your config):
 
 ```bash
 uv run orchestack init --repo /path/to/target-repo --agent agy --forge auto
+
+git -C /path/to/target-repo add .orchestack.toml .gitignore prompts docs
+git -C /path/to/target-repo commit -m "chore: initialize orchestack config"
+git -C /path/to/target-repo push -u origin main
 ```
 
-### Step 2: Run Pre-Flight Diagnostics (`doctor` & `status`)
+### Step 3: Run Pre-Flight Diagnostics (`doctor` & `status`)
 
 Before launching the daemon, verify that your `.orchestack.toml`, `origin` remote, forge authentication (`gh`/`glab`), and agent CLI are ready:
 
@@ -73,7 +108,7 @@ uv run orchestack doctor --repo /path/to/target-repo
 uv run orchestack status --repo /path/to/target-repo
 ```
 
-### Step 3: Run the Autonomous Daemon
+### Step 4: Run the Autonomous Daemon
 
 Start with a safe `--dry-run` or single-cycle `--once` pass, then run continuously:
 
